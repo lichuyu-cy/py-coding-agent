@@ -140,6 +140,10 @@ class BashTool:
                     break
             if failure is not None:
                 await self._terminate_tree(proc)
+        except asyncio.CancelledError:
+            # 外层任务被取消（如 Pipeline 的 deadline 包裹）：先回收进程树再传播取消，避免悬挂。
+            await self._terminate_tree(proc)
+            raise
         finally:
             # 无论正常结束还是被终止，都在此回收 communicate 结果（进程已退出，管道已关闭）。
             stdout_bytes, stderr_bytes = await communicate

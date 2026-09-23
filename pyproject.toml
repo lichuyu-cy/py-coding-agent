@@ -8,7 +8,9 @@ version = "0.1.0"
 description = "Python coding agent harness: bounded agent loop, tool pipeline, context management, events and recovery."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "jsonschema>=4.18",
+]
 
 [project.optional-dependencies]
 dev = [

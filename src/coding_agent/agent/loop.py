@@ -50,6 +50,7 @@ from coding_agent.ports.provider import (
     ProviderToolCallPart,
     ToolDefinition,
 )
+from coding_agent.ports.tool import ToolOutcome
 
 
 class LoopEventKind(StrEnum):
@@ -74,25 +75,32 @@ class LoopEvent:
 
 LoopObserver = Callable[[LoopEvent], None]
 
-
-@dataclass(frozen=True, slots=True)
-class ToolOutcome:
-    """极简工具执行结果（阶段 07 起由 Pipeline 的完整结果流程取代）。"""
-
-    status: ToolResultStatus
-    content: str
-    artifact_ref: str | None = None
-    error_kind: str | None = None
+# ToolOutcome 自阶段 07 起归属 ports.tool（Pipeline 归一结果载荷），此处重导出保持兼容。
+__all__ = [
+    "AgentLoop",
+    "LoopEvent",
+    "LoopEventKind",
+    "LoopObserver",
+    "LoopOutcome",
+    "MinimalToolExecutor",
+    "RunLimits",
+    "ToolOutcome",
+]
 
 
 class MinimalToolExecutor(Protocol):
-    """极简工具执行口：阶段 04 用于驱动 Loop 与 Fake 观察；阶段 07 替换为 Pipeline。
+    """工具执行口：阶段 07 起由 ToolPipeline 实现（结构匹配）。
 
-    生产路径不直接暴露给模型；本阶段没有 Registry/Pipeline，执行方由组装方注入。
+    生产路径不直接暴露给模型；本协议保持"工具必经统一口"的形状。
     """
 
     async def execute(
-        self, call: ToolCall, *, workspace: Path, cancel: CancelSignal | None
+        self,
+        call: ToolCall,
+        *,
+        workspace: Path,
+        cancel: CancelSignal | None,
+        deadline: float | None = None,
     ) -> ToolOutcome: ...
 
 
@@ -326,7 +334,9 @@ class AgentLoop:
                             StateTrigger.TOOL_CALL_COMPLETE,
                             tool_call_id=str(call.id),
                         )
-                    outcome = await self._executor.execute(call, workspace=workspace, cancel=None)
+                    outcome = await self._executor.execute(
+                        call, workspace=workspace, cancel=None, deadline=remaining_seconds()
+                    )
                     tool_calls_used += 1
                     state = state.transition(state.state_seq, StateTrigger.TOOL_RESULT_RESOLVED)
                     commit_result(call, outcome)

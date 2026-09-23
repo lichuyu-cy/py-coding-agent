@@ -47,7 +47,7 @@ class FakeExecutor:
         self.workspaces: list[Path] = []
 
     async def execute(
-        self, call: ToolCall, *, workspace: Path, cancel: CancelSignal | None
+        self, call: ToolCall, *, workspace: Path, cancel: CancelSignal | None, deadline: float | None = None
     ) -> ToolOutcome:
         self.calls.append(call)
         self.workspaces.append(workspace)

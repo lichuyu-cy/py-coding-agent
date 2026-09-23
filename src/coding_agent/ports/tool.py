@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from coding_agent.domain.errors import HarnessError
+from coding_agent.domain.messages import ToolResultStatus
 from coding_agent.ports.provider import CancelSignal
 
 
@@ -48,6 +49,19 @@ class ToolExecution:
     output: str
     exit_code: int | None = None
     artifacts: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ToolOutcome:
+    """Pipeline 归一后的工具结果载荷（不含 MessageMeta；由 Runtime 附着元数据后入历史）。
+
+    status 使用 domain 的 ToolResultStatus；error_kind 为稳定分类字符串。
+    """
+
+    status: ToolResultStatus
+    content: str
+    artifact_ref: str | None = None
+    error_kind: str | None = None
 
 
 class ToolExecutionError(HarnessError):
