@@ -17,3 +17,4 @@
 | 03 | [03-llm-provider-fake.md](03-llm-provider-fake.md) | `feat: add provider port and fake` |
 | 04 | [04-minimal-agent-loop.md](04-minimal-agent-loop.md) | `feat: add minimal loop` |
 | 05 | [05-coding-tools.md](05-coding-tools.md) | `feat: add coding tools` |
+| 06 | [06-tool-registry.md](06-tool-registry.md) | `feat: add tool registry` |
