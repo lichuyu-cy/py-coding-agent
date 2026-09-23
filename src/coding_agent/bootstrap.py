@@ -10,6 +10,7 @@ from collections.abc import Callable, Sequence
 
 from coding_agent.agent.loop import LoopObserver, RunLimits
 from coding_agent.agent.runtime import DEFAULT_SYSTEM_PROMPT, AgentRuntime
+from coding_agent.context.builder import ContextManager
 from coding_agent.domain.messages import ToolResult
 from coding_agent.ports.provider import Provider, ToolDefinition
 from coding_agent.tools.bash import BashTool
@@ -49,6 +50,7 @@ def build_runtime(
     pipeline: ToolPipeline | None = None,
     safety_policy: SafetyPolicy | None = None,
     observation_formatter: Callable[[ToolResult], str] | None = to_model_observation,
+    context_manager: ContextManager | None = None,
 ) -> AgentRuntime:
     """组装 Runtime：注册表 → 工具声明（快照）→ Pipeline（含安全策略）→ Runtime。"""
     active_registry = registry or build_registry()
@@ -70,4 +72,5 @@ def build_runtime(
         tools=definitions,
         model_name=model_name,
         observation_formatter=observation_formatter,
+        context_manager=context_manager,
     )

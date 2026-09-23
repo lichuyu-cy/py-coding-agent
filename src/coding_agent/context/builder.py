@@ -1,0 +1,201 @@
+"""Context Manager：为每一次模型请求构造确定性、可解释、预算内的上下文。
+
+- 只选择/转换消息，不编辑原始历史，不决定模型答案；
+- `build(log)` 每次从同一版本的历史生成一次性 Provider 请求快照（不持久化转换结果）；
+- 合法性校验：空历史、助手尾部、未完成的工具调用组都显式返回 ContextError；
+- source_ids 保留完整来源（section 名 + 消息 ID），保证请求可解释、可复现；
+- 预算检查使用预留的 TokenCounter 接口（阶段 13 的 TokenManager 取代占位计数器）；
+  预算不足时返回 ContextError（真实压缩在阶段 14 接入）。
+
+阶段 12/14 的扩展点：`extra_sections`（技能正文、摘要）按顺序并入 system 段；
+`summary_version` 字段已预留（阶段 14 填充）。
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+
+from coding_agent.domain.errors import HarnessError
+from coding_agent.domain.messages import (
+    AssistantMessage,
+    Message,
+    MessageLog,
+    SystemMessage,
+    ToolResult,
+    UserMessage,
+)
+from coding_agent.ports.provider import (
+    ProviderMessage,
+    ProviderMessageRole,
+    ProviderToolCallPart,
+)
+from coding_agent.ports.tokenizer import SimpleTokenCounter, TokenCounter
+
+__all__ = [
+    "ContextError",
+    "ContextManager",
+    "ContextPolicy",
+    "ContextSnapshot",
+    "PromptSection",
+    "convert_to_provider",
+]
+
+
+class ContextError(HarnessError):
+    """上下文无法构造：历史不完整、尾部不可响应或预算不足。"""
+
+
+@dataclass(frozen=True, slots=True)
+class PromptSection:
+    """system 前缀中的命名段落（按顺序拼接）。"""
+
+    name: str
+    content: str
+
+
+@dataclass(frozen=True, slots=True)
+class ContextPolicy:
+    """上下文策略：system 段落配置与预算上限。"""
+
+    system_prompt: str
+    project_context: str | None = None
+    max_tokens: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ContextSnapshot:
+    """一次模型请求的完整上下文快照。"""
+
+    messages: tuple[ProviderMessage, ...]
+    source_ids: tuple[str, ...]
+    estimated_tokens: int
+    sections: tuple[PromptSection, ...]
+    summary_version: int | None = None
+
+
+def convert_to_provider(
+    messages: Sequence[Message],
+    *,
+    observation_formatter: Callable[[ToolResult], str] | None = None,
+) -> tuple[ProviderMessage, ...]:
+    """把持久消息投影为 Provider 消息（一次性、无副作用）。"""
+    converted: list[ProviderMessage] = []
+    for message in messages:
+        if isinstance(message, SystemMessage):
+            converted.append(ProviderMessage(role=ProviderMessageRole.SYSTEM, content=message.content))
+        elif isinstance(message, UserMessage):
+            converted.append(ProviderMessage(role=ProviderMessageRole.USER, content=message.content))
+        elif isinstance(message, AssistantMessage):
+            converted.append(
+                ProviderMessage(
+                    role=ProviderMessageRole.ASSISTANT,
+                    content=message.content,
+                    tool_calls=tuple(
+                        ProviderToolCallPart(id=str(call.id), name=call.name, arguments=dict(call.arguments))
+                        for call in sorted(message.tool_calls, key=lambda c: c.ordinal)
+                    ),
+                )
+            )
+        elif isinstance(message, ToolResult):
+            content = (
+                observation_formatter(message)
+                if observation_formatter is not None
+                else message.content
+            )
+            converted.append(
+                ProviderMessage(
+                    role=ProviderMessageRole.TOOL,
+                    content=content,
+                    tool_call_id=str(message.tool_call_id),
+                )
+            )
+    return tuple(converted)
+
+
+class ContextManager:
+    """上下文构建器；Runtime/Loop 唯一调用者，Provider 只消费结果。"""
+
+    def __init__(
+        self,
+        policy: ContextPolicy,
+        *,
+        counter: TokenCounter | None = None,
+        observation_formatter: Callable[[ToolResult], str] | None = None,
+    ) -> None:
+        self._policy = policy
+        self._counter: TokenCounter = counter or SimpleTokenCounter()
+        self._observation_formatter = observation_formatter
+
+    @property
+    def policy(self) -> ContextPolicy:
+        return self._policy
+
+    def build(
+        self,
+        log: MessageLog,
+        *,
+        extra_sections: Sequence[PromptSection] = (),
+    ) -> ContextSnapshot:
+        """按当前历史构造请求快照；相同输入保证相同输出（确定性）。"""
+        messages = log.messages
+        self._validate_history(messages)
+
+        sections: list[PromptSection] = [PromptSection(name="system", content=self._policy.system_prompt)]
+        if self._policy.project_context:
+            sections.append(PromptSection(name="project", content=self._policy.project_context))
+        sections.extend(extra_sections)
+
+        system_content = "\n\n".join(section.content for section in sections)
+        provider_messages = (
+            ProviderMessage(role=ProviderMessageRole.SYSTEM, content=system_content),
+            *convert_to_provider(messages, observation_formatter=self._observation_formatter),
+        )
+
+        source_ids = tuple(f"section:{section.name}" for section in sections) + tuple(
+            str(message.meta.id) for message in messages
+        )
+        estimated = self._estimate(system_content, provider_messages)
+
+        if self._policy.max_tokens is not None and estimated > self._policy.max_tokens:
+            raise ContextError(
+                f"context does not fit the configured budget: estimated {estimated} tokens "
+                f"exceed max_tokens {self._policy.max_tokens}"
+            )
+
+        return ContextSnapshot(
+            messages=provider_messages,
+            source_ids=source_ids,
+            estimated_tokens=estimated,
+            sections=tuple(sections),
+            summary_version=None,
+        )
+
+    @staticmethod
+    def _validate_history(messages: Sequence[Message]) -> None:
+        if not messages:
+            raise ContextError("cannot build context from an empty history")
+        if isinstance(messages[-1], AssistantMessage):
+            raise ContextError(
+                "history tail is an assistant message; there is no observation to respond to"
+            )
+        for message in messages:
+            if isinstance(message, AssistantMessage):
+                for call in message.tool_calls:
+                    resolved = any(
+                        isinstance(candidate, ToolResult) and candidate.tool_call_id == call.id
+                        for candidate in messages
+                    )
+                    if not resolved:
+                        raise ContextError(
+                            f"incomplete tool group: call {call.id!r} has no final result"
+                        )
+
+    def _estimate(self, system_content: str, messages: Sequence[ProviderMessage]) -> int:
+        total = self._counter.count_text(system_content)
+        for message in messages[1:]:  # messages[0] 是 system，已单独计入
+            total += self._counter.count_text(message.content)
+            for call in message.tool_calls:
+                total += self._counter.count_text(call.name)
+                total += self._counter.count_text(str(dict(call.arguments)))
+        return total

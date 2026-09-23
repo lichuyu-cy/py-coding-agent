@@ -21,3 +21,4 @@
 | 07 | [07-tool-pipeline.md](07-tool-pipeline.md) | `feat: add tool pipeline` |
 | 08 | [08-tool-governance.md](08-tool-governance.md) | `feat: govern tool execution` |
 | 09 | [09-runtime-controls.md](09-runtime-controls.md) | `feat: add runtime controls` |
+| 10 | [10-context-manager.md](10-context-manager.md) | `feat: build provider context` |

@@ -23,6 +23,7 @@ from coding_agent.agent.control import (
     UnknownRunError,
 )
 from coding_agent.agent.loop import AgentLoop, LoopObserver, MinimalToolExecutor, RunLimits
+from coding_agent.context.builder import ContextManager
 from coding_agent.domain.errors import HarnessError
 from coding_agent.domain.messages import (
     AssistantMessage,
@@ -120,6 +121,7 @@ class AgentRuntime:
         tools: tuple[ToolDefinition, ...] = (),
         model_name: str = "default",
         observation_formatter: Callable[[ToolResult], str] | None = None,
+        context_manager: ContextManager | None = None,
     ) -> None:
         self.registry = registry or InMemorySessionRegistry()
         self._workspaces: dict[str, Path] = {}
@@ -134,6 +136,7 @@ class AgentRuntime:
             model_name=model_name,
             observer=observer,
             observation_formatter=observation_formatter,
+            context_manager=context_manager,
         )
 
     async def run(

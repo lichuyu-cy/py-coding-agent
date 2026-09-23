@@ -20,11 +20,11 @@ from pathlib import Path
 from typing import Protocol
 
 from coding_agent.agent.control import FollowUpQueue, RunControl
+from coding_agent.context.builder import ContextManager, ContextPolicy
 from coding_agent.domain.messages import (
     AssistantMessage,
     MessageLog,
     MessageMeta,
-    SystemMessage,
     ToolCall,
     ToolResult,
     ToolResultStatus,
@@ -46,9 +46,6 @@ from coding_agent.ports.provider import (
     Provider,
     ProviderError,
     ProviderErrorKind,
-    ProviderMessage,
-    ProviderMessageRole,
-    ProviderToolCallPart,
     ToolDefinition,
 )
 from coding_agent.ports.tool import ToolOutcome
@@ -151,6 +148,7 @@ class AgentLoop:
         model_name: str = "default",
         observer: LoopObserver | None = None,
         observation_formatter: Callable[[ToolResult], str] | None = None,
+        context_manager: ContextManager | None = None,
     ) -> None:
         self._provider = provider
         self._executor = executor
@@ -160,6 +158,10 @@ class AgentLoop:
         self._model_name = model_name
         self._observer = observer
         self._observation_formatter = observation_formatter
+        self._context = context_manager or ContextManager(
+            ContextPolicy(system_prompt=system_prompt),
+            observation_formatter=observation_formatter,
+        )
 
     async def run(
         self,
@@ -460,39 +462,6 @@ class AgentLoop:
         )
 
     def _build_request(self, log: MessageLog) -> ModelRequest:
-        """最小上下文组装：system + 已提交消息的 Provider 投影（阶段 10 替换）。"""
-        messages: list[ProviderMessage] = [
-            ProviderMessage(role=ProviderMessageRole.SYSTEM, content=self._system_prompt)
-        ]
-        for message in log.messages:
-            if isinstance(message, SystemMessage):
-                messages.append(ProviderMessage(role=ProviderMessageRole.SYSTEM, content=message.content))
-            elif isinstance(message, UserMessage):
-                messages.append(ProviderMessage(role=ProviderMessageRole.USER, content=message.content))
-            elif isinstance(message, AssistantMessage):
-                messages.append(
-                    ProviderMessage(
-                        role=ProviderMessageRole.ASSISTANT,
-                        content=message.content,
-                        tool_calls=tuple(
-                            ProviderToolCallPart(
-                                id=str(call.id), name=call.name, arguments=dict(call.arguments)
-                            )
-                            for call in sorted(message.tool_calls, key=lambda c: c.ordinal)
-                        ),
-                    )
-                )
-            elif isinstance(message, ToolResult):
-                content = (
-                    self._observation_formatter(message)
-                    if self._observation_formatter is not None
-                    else message.content
-                )
-                messages.append(
-                    ProviderMessage(
-                        role=ProviderMessageRole.TOOL,
-                        content=content,
-                        tool_call_id=str(message.tool_call_id),
-                    )
-                )
-        return ModelRequest(messages=tuple(messages), tools=self._tools, model=self._model_name)
+        """经 ContextManager 构造确定性的 Provider 请求（阶段 10 接入）。"""
+        snapshot = self._context.build(log)
+        return ModelRequest(messages=snapshot.messages, tools=self._tools, model=self._model_name)
