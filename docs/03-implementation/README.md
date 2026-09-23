@@ -13,3 +13,4 @@
 | 阶段 | 文档 | 提交标题 |
 | --- | --- | --- |
 | 01 | [01-project-skeleton.md](01-project-skeleton.md) | `chore: scaffold project` |
+| 02 | [02-message-state.md](02-message-state.md) | `feat: define messages and state` |
