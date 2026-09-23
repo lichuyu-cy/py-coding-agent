@@ -147,6 +147,7 @@ class AgentLoop:
         tools: tuple[ToolDefinition, ...] = (),
         model_name: str = "default",
         observer: LoopObserver | None = None,
+        observation_formatter: Callable[[ToolResult], str] | None = None,
     ) -> None:
         self._provider = provider
         self._executor = executor
@@ -155,6 +156,7 @@ class AgentLoop:
         self._tools = tools
         self._model_name = model_name
         self._observer = observer
+        self._observation_formatter = observation_formatter
 
     async def run(
         self, *, log: MessageLog, state: RuntimeState, workspace: Path
@@ -204,6 +206,8 @@ class AgentLoop:
                 content=outcome.content,
                 artifact_ref=outcome.artifact_ref,
                 error_kind=outcome.error_kind,
+                retryable=outcome.retryable,
+                exit_code=outcome.exit_code,
             )
             log.append(result)
             emit(LoopEventKind.TOOL_RESULT_COMMITTED, turn=state.current_turn, message_id=str(result.meta.id))
@@ -323,6 +327,7 @@ class AgentLoop:
                                     status=ToolResultStatus.CANCELLED,
                                     content="tool call budget exhausted; call was not executed",
                                     error_kind="tool_budget_exhausted",
+                                    retryable=False,
                                 ),
                             )
                         limit_hit = "max_tool_calls"
@@ -389,10 +394,15 @@ class AgentLoop:
                     )
                 )
             elif isinstance(message, ToolResult):
+                content = (
+                    self._observation_formatter(message)
+                    if self._observation_formatter is not None
+                    else message.content
+                )
                 messages.append(
                     ProviderMessage(
                         role=ProviderMessageRole.TOOL,
-                        content=message.content,
+                        content=content,
                         tool_call_id=str(message.tool_call_id),
                     )
                 )

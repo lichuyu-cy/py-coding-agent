@@ -1,21 +1,24 @@
 """Bootstrap：单一组装入口。
 
-按依赖方向在此组装实现层：注册表（四个编码工具）→ Tool Pipeline → Runtime。
+按依赖方向在此组装实现层：注册表（四个编码工具）→ Tool Pipeline（含 SafetyPolicy）→ Runtime。
 CLI / Server / Benchmark 只调用本模块暴露的构建函数，不自行拼装内部组件。
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 from coding_agent.agent.loop import LoopObserver, RunLimits
 from coding_agent.agent.runtime import DEFAULT_SYSTEM_PROMPT, AgentRuntime
+from coding_agent.domain.messages import ToolResult
 from coding_agent.ports.provider import Provider, ToolDefinition
 from coding_agent.tools.bash import BashTool
 from coding_agent.tools.edit import EditTool
 from coding_agent.tools.pipeline import ToolPipeline
 from coding_agent.tools.read import ReadTool
+from coding_agent.tools.recovery import to_model_observation
 from coding_agent.tools.registry import RegistrySnapshot, ToolRegistry
+from coding_agent.tools.safety import SafetyPolicy
 from coding_agent.tools.write import WriteTool
 
 CODING_TOOL_NAMES = ("read", "write", "edit", "bash")
@@ -44,8 +47,10 @@ def build_runtime(
     model_name: str = "default",
     registry: ToolRegistry | None = None,
     pipeline: ToolPipeline | None = None,
+    safety_policy: SafetyPolicy | None = None,
+    observation_formatter: Callable[[ToolResult], str] | None = to_model_observation,
 ) -> AgentRuntime:
-    """组装 Runtime：注册表 → 工具声明（快照）→ Pipeline（执行口）→ Runtime。"""
+    """组装 Runtime：注册表 → 工具声明（快照）→ Pipeline（含安全策略）→ Runtime。"""
     active_registry = registry or build_registry()
     snapshot: RegistrySnapshot = active_registry.snapshot()
     definitions: tuple[ToolDefinition, ...]
@@ -53,7 +58,9 @@ def build_runtime(
         definitions = active_registry.definitions(tool_allowlist)
     else:
         definitions = snapshot.definitions()
-    active_pipeline = pipeline or ToolPipeline(active_registry)
+    active_pipeline = pipeline or ToolPipeline(
+        active_registry, safety_policy=safety_policy or SafetyPolicy()
+    )
     return AgentRuntime(
         provider=provider,
         executor=active_pipeline,
@@ -62,4 +69,5 @@ def build_runtime(
         observer=observer,
         tools=definitions,
         model_name=model_name,
+        observation_formatter=observation_formatter,
     )

@@ -19,3 +19,4 @@
 | 05 | [05-coding-tools.md](05-coding-tools.md) | `feat: add coding tools` |
 | 06 | [06-tool-registry.md](06-tool-registry.md) | `feat: add tool registry` |
 | 07 | [07-tool-pipeline.md](07-tool-pipeline.md) | `feat: add tool pipeline` |
+| 08 | [08-tool-governance.md](08-tool-governance.md) | `feat: govern tool execution` |

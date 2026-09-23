@@ -32,6 +32,7 @@ import jsonschema
 from coding_agent.domain.messages import ToolCall, ToolResultStatus
 from coding_agent.ports.provider import CancelSignal
 from coding_agent.ports.tool import ToolContext, ToolExecution, ToolExecutionError, ToolOutcome
+from coding_agent.tools.recovery import hint_for_kind, normalize_internal_error, normalize_tool_error
 from coding_agent.tools.registry import (
     RegisteredTool,
     RegistrySnapshot,
@@ -133,6 +134,7 @@ class PipelineEventKind(StrEnum):
     TOOL_CALL_END = "tool_call_end"
     TOOL_CALL_ERROR = "tool_call_error"
     HOOK_ERROR = "hook_error"
+    POLICY_DECISION = "policy_decision"
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,11 +146,6 @@ class PipelineEvent:
 
 
 PipelineObserver = Callable[[PipelineEvent], None]
-
-_STATUS_BY_ERROR_KIND: dict[str, ToolResultStatus] = {
-    "timeout": ToolResultStatus.TIMEOUT,
-    "cancelled": ToolResultStatus.CANCELLED,
-}
 
 
 class ToolPipeline:
@@ -235,15 +232,11 @@ class ToolPipeline:
             execution = await self._run_tool(record, invocation)
             outcome = self._normalize_success(execution)
         except ToolExecutionError as err:
-            outcome = self._normalize_tool_error(err)
+            outcome = normalize_tool_error(err)
         except asyncio.CancelledError:
             raise
         except Exception as err:  # noqa: BLE001 - 归一为内部错误，不猜测类型
-            outcome = ToolOutcome(
-                status=ToolResultStatus.ERROR,
-                content=f"tool {name!r} failed with an internal error: {type(err).__name__}: {err}",
-                error_kind="internal_error",
-            )
+            outcome = normalize_internal_error(err)
 
         # 8. 输出处理（裁剪/artifact，阶段 11）
         if self._output_processor is not None:
@@ -319,9 +312,12 @@ class ToolPipeline:
     def _authorize(
         self, policy: PermissionPolicy | SafetyPolicy, invocation: ToolInvocation, stage: str
     ) -> PermissionResult:
-        """执行策略判断；策略自身异常归一为拒绝（不静默放行），并记录 HookError 事件。"""
+        """执行策略判断；策略自身异常归一为拒绝（不静默放行），并记录 HookError 事件。
+
+        每次正常判断都发 POLICY_DECISION 证据事件（decision/reason，可选 risk/policy_version）。
+        """
         try:
-            return policy.authorize(invocation)
+            result = policy.authorize(invocation)
         except Exception as err:  # noqa: BLE001 - 策略故障必须可审计且不得放行
             self._emit(
                 PipelineEventKind.HOOK_ERROR,
@@ -332,27 +328,34 @@ class ToolPipeline:
                 PermissionDecision.DENY,
                 f"{stage} policy raised {type(err).__name__}: {err}",
             )
+        detail = f"stage={stage} decision={result.decision.value} reason={result.reason}"
+        risk = getattr(result, "risk", None)
+        version = getattr(result, "policy_version", None)
+        if risk is not None:
+            detail += f" risk={risk}"
+        if version:
+            detail += f" policy={version}"
+        self._emit(PipelineEventKind.POLICY_DECISION, invocation.call, detail=detail)
+        return result
 
     @staticmethod
     def _normalize_success(execution: ToolExecution) -> ToolOutcome:
+        artifact = execution.artifacts[0] if execution.artifacts else None
         if execution.exit_code is not None and execution.exit_code != 0:
             return ToolOutcome(
                 status=ToolResultStatus.ERROR,
                 content=execution.output,
-                artifact_ref=execution.artifacts[0] if execution.artifacts else None,
+                artifact_ref=artifact,
                 error_kind="nonzero_exit",
+                retryable=hint_for_kind("nonzero_exit").retryable,
+                exit_code=execution.exit_code,
             )
         return ToolOutcome(
             status=ToolResultStatus.COMPLETED,
             content=execution.output,
-            artifact_ref=execution.artifacts[0] if execution.artifacts else None,
+            artifact_ref=artifact,
+            exit_code=execution.exit_code,
         )
-
-    @staticmethod
-    def _normalize_tool_error(err: ToolExecutionError) -> ToolOutcome:
-        status = _STATUS_BY_ERROR_KIND.get(err.kind, ToolResultStatus.ERROR)
-        content = f"{err.message}\n{err.output}" if err.output else err.message
-        return ToolOutcome(status=status, content=content, error_kind=err.kind)
 
     def _denial_outcome(
         self, call: ToolCall, stage: str, result: PermissionResult

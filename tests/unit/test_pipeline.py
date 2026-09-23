@@ -182,7 +182,12 @@ class TestStageOrder:
         assert outcome.status is ToolResultStatus.COMPLETED
         assert outcome.content == "[processed] ok-output"
         kinds = [e.kind for e in harness.pipeline_events]
-        assert kinds == [PipelineEventKind.TOOL_CALL_START, PipelineEventKind.TOOL_CALL_END]
+        assert kinds == [
+            PipelineEventKind.POLICY_DECISION,
+            PipelineEventKind.POLICY_DECISION,
+            PipelineEventKind.TOOL_CALL_START,
+            PipelineEventKind.TOOL_CALL_END,
+        ]
 
     async def test_defaults_are_filled_before_tool(self, tmp_path: Path) -> None:
         schema = {"type": "object", "properties": {"text": {"type": "string", "default": "defaulted"}}}

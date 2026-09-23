@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -109,6 +110,7 @@ class AgentRuntime:
         observer: LoopObserver | None = None,
         tools: tuple[ToolDefinition, ...] = (),
         model_name: str = "default",
+        observation_formatter: Callable[[ToolResult], str] | None = None,
     ) -> None:
         self.registry = registry or InMemorySessionRegistry()
         self._workspaces: dict[str, Path] = {}
@@ -120,6 +122,7 @@ class AgentRuntime:
             tools=tools,
             model_name=model_name,
             observer=observer,
+            observation_formatter=observation_formatter,
         )
 
     async def run(

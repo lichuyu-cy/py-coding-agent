@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -55,13 +56,48 @@ class ToolExecution:
 class ToolOutcome:
     """Pipeline 归一后的工具结果载荷（不含 MessageMeta；由 Runtime 附着元数据后入历史）。
 
-    status 使用 domain 的 ToolResultStatus；error_kind 为稳定分类字符串。
+    status 使用 domain 的 ToolResultStatus；error_kind 为 ToolErrorKind（或等价字符串）；
+    retryable/exit_code 为可操作恢复信息（阶段 08 起填充）。
     """
 
     status: ToolResultStatus
     content: str
     artifact_ref: str | None = None
     error_kind: str | None = None
+    retryable: bool | None = None
+    exit_code: int | None = None
+
+
+class ToolErrorKind(StrEnum):
+    """工具失败分类的权威目录（字符串值即稳定的 error_kind 契约）。
+
+    生产者：编码工具（ToolExecutionError.kind）与 Pipeline（检查点拒绝）。
+    消费者：recovery.normalize_*（状态/可重试归一）与 to_model_observation（模型观察格式）。
+    """
+
+    FILE_NOT_FOUND = "file_not_found"
+    NOT_A_FILE = "not_a_file"
+    BINARY_FILE = "binary_file"
+    INVALID_ENCODING = "invalid_encoding"
+    FILE_TOO_LARGE = "file_too_large"
+    PATH_ESCAPE = "path_escape"
+    INVALID_ARGUMENTS = "invalid_arguments"
+    REPLACE_NOT_FOUND = "replace_not_found"
+    REPLACE_NOT_UNIQUE = "replace_not_unique"
+    TIMEOUT = "timeout"
+    CANCELLED = "cancelled"
+    SPAWN_FAILED = "spawn_failed"
+    WORKSPACE_MISSING = "workspace_missing"
+    UNKNOWN_TOOL = "unknown_tool"
+    NONZERO_EXIT = "nonzero_exit"
+    INTERNAL_ERROR = "internal_error"
+    HOOK_DENIED = "hook_denied"
+    PERMISSION_DENIED = "permission_denied"
+    PERMISSION_APPROVAL_REQUIRED = "permission_approval_required"
+    SAFETY_DENIED = "safety_denied"
+    SAFETY_APPROVAL_REQUIRED = "safety_approval_required"
+    TOOL_BUDGET_EXHAUSTED = "tool_budget_exhausted"
+    UNCERTAIN_EFFECT = "uncertain_effect"
 
 
 class ToolExecutionError(HarnessError):

@@ -216,6 +216,8 @@ class ToolResult:
     content: str
     artifact_ref: str | None = None
     error_kind: str | None = None
+    retryable: bool | None = None
+    exit_code: int | None = None
 
     @property
     def message_type(self) -> str:
@@ -239,6 +241,8 @@ def message_to_dict(message: Message) -> dict[str, Any]:
         data["content"] = message.content
         data["artifact_ref"] = message.artifact_ref
         data["error_kind"] = message.error_kind
+        data["retryable"] = message.retryable
+        data["exit_code"] = message.exit_code
     else:  # pragma: no cover - 防御未预期类型
         raise MessageValidationError("unknown_message_type", f"unsupported message type {type(message)!r}")
     return data
@@ -280,10 +284,16 @@ def message_from_dict(data: Mapping[str, Any]) -> Message:
     if message_type == "tool_result":
         artifact_ref = data.get("artifact_ref")
         error_kind = data.get("error_kind")
+        retryable = data.get("retryable")
+        exit_code = data.get("exit_code")
         if artifact_ref is not None and not isinstance(artifact_ref, str):
             raise MessageValidationError("malformed_message", "tool_result.artifact_ref must be a string or null")
         if error_kind is not None and not isinstance(error_kind, str):
             raise MessageValidationError("malformed_message", "tool_result.error_kind must be a string or null")
+        if retryable is not None and not isinstance(retryable, bool):
+            raise MessageValidationError("malformed_message", "tool_result.retryable must be a boolean or null")
+        if exit_code is not None and (not isinstance(exit_code, int) or isinstance(exit_code, bool)):
+            raise MessageValidationError("malformed_message", "tool_result.exit_code must be an int or null")
         return ToolResult(
             meta=meta,
             tool_call_id=ToolCallId(_require_str(data, "tool_call_id", "tool_result")),
@@ -291,6 +301,8 @@ def message_from_dict(data: Mapping[str, Any]) -> Message:
             content=_require_text(data, "content", "tool_result"),
             artifact_ref=artifact_ref,
             error_kind=error_kind,
+            retryable=retryable,
+            exit_code=exit_code,
         )
     raise MessageValidationError("unknown_message_type", f"unsupported message type {message_type!r}")
 
@@ -365,6 +377,12 @@ class MessageLog:
                 )
             if not isinstance(message.status, ToolResultStatus):
                 raise MessageValidationError("malformed_message", "tool result status must be ToolResultStatus")
+            if message.retryable is not None and not isinstance(message.retryable, bool):
+                raise MessageValidationError("malformed_message", "tool result retryable must be a boolean or None")
+            if message.exit_code is not None and (
+                not isinstance(message.exit_code, int) or isinstance(message.exit_code, bool)
+            ):
+                raise MessageValidationError("malformed_message", "tool result exit_code must be an int or None")
 
     def _validate_tool_calls(self, message: AssistantMessage) -> None:
         ordinals = [call.ordinal for call in message.tool_calls]
