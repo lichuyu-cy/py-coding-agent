@@ -13,6 +13,15 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from coding_agent.agent.control import (
+    AbortReason,
+    FollowUpItem,
+    FollowUpQueue,
+    RunControl,
+    SteeringMessage,
+    SteeringRejectedError,
+    UnknownRunError,
+)
 from coding_agent.agent.loop import AgentLoop, LoopObserver, MinimalToolExecutor, RunLimits
 from coding_agent.domain.errors import HarnessError
 from coding_agent.domain.messages import (
@@ -114,6 +123,8 @@ class AgentRuntime:
     ) -> None:
         self.registry = registry or InMemorySessionRegistry()
         self._workspaces: dict[str, Path] = {}
+        self._active_runs: dict[str, RunControl] = {}
+        self._follow_ups: dict[str, FollowUpQueue] = {}
         self._loop = AgentLoop(
             provider=provider,
             executor=executor,
@@ -142,12 +153,23 @@ class AgentRuntime:
             resolved_workspace = Path(workspace)
             self._workspaces[log.session_id] = resolved_workspace
             state = RuntimeState(run_id=new_id("run")).transition(0, StateTrigger.START)
+            control = RunControl(state.run_id)
+            self._active_runs[control.run_id] = control
             user_message = UserMessage(
                 meta=self._new_meta(log, state),
                 content=task,
             )
             log.append(user_message)
-            outcome = await self._loop.run(log=log, state=state, workspace=resolved_workspace)
+            try:
+                outcome = await self._loop.run(
+                    log=log,
+                    state=state,
+                    workspace=resolved_workspace,
+                    control=control,
+                    follow_ups=self._follow_up_queue(log.session_id),
+                )
+            finally:
+                self._active_runs.pop(control.run_id, None)
             return self._to_result(log, outcome.state, outcome.turns, outcome.tool_calls, outcome.provider_calls, outcome.final_text, outcome.limit_hit)
         finally:
             self.registry.release(log.session_id)
@@ -170,10 +192,60 @@ class AgentRuntime:
             raise RunConflictError(f"session {session_id!r} already has an active run")
         try:
             state = RuntimeState(run_id=new_id("run")).transition(0, StateTrigger.START)
-            outcome = await self._loop.run(log=log, state=state, workspace=resolved)
+            control = RunControl(state.run_id)
+            self._active_runs[control.run_id] = control
+            try:
+                outcome = await self._loop.run(
+                    log=log,
+                    state=state,
+                    workspace=resolved,
+                    control=control,
+                    follow_ups=self._follow_up_queue(session_id),
+                )
+            finally:
+                self._active_runs.pop(control.run_id, None)
             return self._to_result(log, outcome.state, outcome.turns, outcome.tool_calls, outcome.provider_calls, outcome.final_text, outcome.limit_hit)
         finally:
             self.registry.release(session_id)
+
+    # ---- 控制通道（阶段 09：内存队列；阶段 19 持久化队列位置） ----
+
+    def submit_steering(
+        self, run_id: str, text: str, *, client_event_id: str | None = None
+    ) -> SteeringMessage:
+        """向活动 run 提交 steering；run 不存在或已结束时显式拒绝（改用 submit_follow_up）。"""
+        control = self._active_runs.get(run_id)
+        if control is None:
+            raise SteeringRejectedError(run_id)
+        return control.steering.enqueue(text, client_event_id=client_event_id)
+
+    def abort(self, run_id: str, reason: AbortReason | str = AbortReason.USER_REQUEST) -> bool:
+        """请求取消活动 run（幂等）：返回本次调用是否首次触发取消。
+
+        仅设置取消标志；由 Loop 在安全边界观察取消并完成 ABORTING→ABORTED。
+        """
+        control = self._active_runs.get(run_id)
+        if control is None:
+            raise UnknownRunError(run_id)
+        return control.cancel.cancel(reason)
+
+    def submit_follow_up(
+        self, session_id: str, text: str, *, client_event_id: str | None = None
+    ) -> FollowUpItem:
+        """向会话提交下一个用户任务（幂等）；在 run 的 turn 结束边界取出一个。"""
+        self.registry.get(session_id)  # 未知会话抛 UnknownSessionError
+        return self._follow_up_queue(session_id).enqueue(text, client_event_id=client_event_id)
+
+    def pending_follow_ups(self, session_id: str) -> int:
+        queue = self._follow_ups.get(session_id)
+        return queue.pending_count() if queue is not None else 0
+
+    def _follow_up_queue(self, session_id: str) -> FollowUpQueue:
+        queue = self._follow_ups.get(session_id)
+        if queue is None:
+            queue = FollowUpQueue()
+            self._follow_ups[session_id] = queue
+        return queue
 
     @staticmethod
     def _new_meta(log: MessageLog, state: RuntimeState) -> MessageMeta:

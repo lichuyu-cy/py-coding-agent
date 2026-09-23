@@ -19,6 +19,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 
+from coding_agent.agent.control import FollowUpQueue, RunControl
 from coding_agent.domain.messages import (
     AssistantMessage,
     MessageLog,
@@ -60,6 +61,8 @@ class LoopEventKind(StrEnum):
     TURN_START = "turn_start"
     ASSISTANT_COMMITTED = "assistant_committed"
     TOOL_RESULT_COMMITTED = "tool_result_committed"
+    STEERING_INJECTED = "steering_injected"
+    FOLLOW_UP_STARTED = "follow_up_started"
     RUN_END = "run_end"
 
 
@@ -159,8 +162,15 @@ class AgentLoop:
         self._observation_formatter = observation_formatter
 
     async def run(
-        self, *, log: MessageLog, state: RuntimeState, workspace: Path
+        self,
+        *,
+        log: MessageLog,
+        state: RuntimeState,
+        workspace: Path,
+        control: RunControl | None = None,
+        follow_ups: FollowUpQueue | None = None,
     ) -> LoopOutcome:
+        control = control or RunControl(state.run_id)
         run_id = state.run_id
         session_id = log.session_id
         turns = 0
@@ -219,9 +229,27 @@ class AgentLoop:
                 asyncio.get_running_loop().time() - started_at
             )
 
+        def inject_user_text(text: str, kind: LoopEventKind, detail: str | None = None) -> None:
+            """在下一个模型请求边界前，把控制消息作为 UserMessage 注入历史。"""
+            message = UserMessage(meta=new_meta(), content=text)
+            log.append(message)
+            emit(kind, turn=state.current_turn, message_id=str(message.meta.id), detail=detail)
+
+        def abort_run(reason: str) -> None:
+            """请求已下达的取消：进入 ABORTING→ABORTED（不启动新工具/新请求）。"""
+            nonlocal state
+            state = state.request_abort(reason)
+            state = state.transition(
+                state.state_seq, StateTrigger.CLEANUP_DONE, stop_reason=StopReason.CANCELLED
+            )
+
         emit(LoopEventKind.RUN_START, turn=state.current_turn)
 
         while True:
+            # 取消优先级最高：任何活动态在边界处观察到取消都立即终止。
+            if control.cancel.is_cancelled:
+                abort_run(control.cancel.reason or "abort requested")
+                break
             remaining = remaining_seconds()
             if remaining is not None and remaining <= 0:
                 limit_hit = "deadline"
@@ -240,6 +268,14 @@ class AgentLoop:
                 )
                 break
 
+            # steering 只在模型请求边界注入（一次性 drain，按入队顺序）。
+            if state.state is AgentState.STEERING:
+                state = state.transition(state.state_seq, StateTrigger.STEERING_INJECTED)
+            for steering_message in control.steering.drain_before_next_request():
+                inject_user_text(
+                    steering_message.text, LoopEventKind.STEERING_INJECTED, detail=steering_message.id
+                )
+
             emit(LoopEventKind.TURN_START, turn=state.current_turn)
             request = self._build_request(log)
 
@@ -250,7 +286,7 @@ class AgentLoop:
             while True:
                 provider_calls += 1
                 try:
-                    calls = self._provider.complete(request, None)
+                    calls = self._provider.complete(request, control.cancel)
                     if remaining is not None:
                         response = await asyncio.wait_for(calls, timeout=remaining)
                     else:
@@ -260,6 +296,9 @@ class AgentLoop:
                     deadline_exceeded = True
                     break
                 except ProviderError as err:
+                    if err.kind is ProviderErrorKind.CANCELLED or control.cancel.is_cancelled:
+                        provider_error = err
+                        break
                     if (
                         err.kind in _TRANSIENT_PROVIDER_ERRORS
                         and retries < self._limits.max_provider_retries
@@ -281,6 +320,12 @@ class AgentLoop:
                 )
                 break
             if provider_error is not None:
+                if (
+                    provider_error.kind is ProviderErrorKind.CANCELLED
+                    or control.cancel.is_cancelled
+                ):
+                    abort_run(control.cancel.reason or "provider request cancelled")
+                    break
                 state = state.transition(
                     state.state_seq, StateTrigger.FAIL, stop_reason=StopReason.PROVIDER_ERROR
                 )
@@ -318,7 +363,22 @@ class AgentLoop:
                     tool_call_id=str(ordered[0].id),
                 )
                 budget_hit = False
+                aborted_mid_batch = False
                 for index, call in enumerate(ordered):
+                    if control.cancel.is_cancelled:
+                        # 取消发生在两次执行之间：为剩余完整调用记录明确的 CANCELLED 结果。
+                        for pending in ordered[index:]:
+                            commit_result(
+                                pending,
+                                ToolOutcome(
+                                    status=ToolResultStatus.CANCELLED,
+                                    content="run aborted; call was not executed",
+                                    error_kind="cancelled",
+                                    retryable=False,
+                                ),
+                            )
+                        aborted_mid_batch = True
+                        break
                     if tool_calls_used >= self._limits.max_tool_calls:
                         for pending in ordered[index:]:
                             commit_result(
@@ -340,12 +400,20 @@ class AgentLoop:
                             tool_call_id=str(call.id),
                         )
                     outcome = await self._executor.execute(
-                        call, workspace=workspace, cancel=None, deadline=remaining_seconds()
+                        call,
+                        workspace=workspace,
+                        cancel=control.cancel,
+                        deadline=remaining_seconds(),
                     )
                     tool_calls_used += 1
                     state = state.transition(state.state_seq, StateTrigger.TOOL_RESULT_RESOLVED)
                     commit_result(call, outcome)
-                    state = state.transition(state.state_seq, StateTrigger.CONTINUE)
+                    is_last_call = index == len(ordered) - 1
+                    if is_last_call and control.steering.has_pending():
+                        # 工具结果处理期间到达的 steering：按状态机进入 STEERING，下次请求前注入。
+                        state = state.transition(state.state_seq, StateTrigger.STEERING_ARRIVED)
+                    else:
+                        state = state.transition(state.state_seq, StateTrigger.CONTINUE)
                 if budget_hit:
                     state = state.transition(
                         state.state_seq,
@@ -354,9 +422,30 @@ class AgentLoop:
                         stop_reason=stop_reason,
                     )
                     break
+                if aborted_mid_batch:
+                    abort_run(control.cancel.reason or "abort requested")
+                    break
+                if control.cancel.is_cancelled:
+                    abort_run(control.cancel.reason or "abort requested")
+                    break
                 continue  # 下一模型回合
 
-            # 无工具调用：正常结束（含 END_TURN / MAX_TOKENS）
+            # 无工具调用：结束当前 turn。steering 优先于 follow-up；否则正常结束。
+            if state.state is AgentState.STEERING:
+                state = state.transition(state.state_seq, StateTrigger.STEERING_INJECTED)
+            steering_after_turn = control.steering.drain_before_next_request()
+            if steering_after_turn:
+                for steering_message in steering_after_turn:
+                    inject_user_text(
+                        steering_message.text, LoopEventKind.STEERING_INJECTED, detail=steering_message.id
+                    )
+                continue
+            next_task = follow_ups.dequeue_after_turn_end() if follow_ups is not None else None
+            if next_task is not None:
+                state = state.transition(state.state_seq, StateTrigger.FOLLOW_UP_READY)
+                state = state.transition(state.state_seq, StateTrigger.TURN_START)
+                inject_user_text(next_task.text, LoopEventKind.FOLLOW_UP_STARTED, detail=next_task.id)
+                continue
             state = state.transition(state.state_seq, StateTrigger.FINISH, stop_reason=stop_reason)
             break
 
