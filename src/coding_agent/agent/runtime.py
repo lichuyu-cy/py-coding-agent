@@ -27,6 +27,7 @@ from coding_agent.context.builder import ContextManager, PromptSection
 from coding_agent.context.skills import SKILLS_DIR, SkillRegistry
 from coding_agent.domain.errors import HarnessError
 from coding_agent.observability.event_bus import EventBus
+from coding_agent.observability.metrics import MetricsAccumulator
 from coding_agent.domain.messages import (
     AssistantMessage,
     MessageLog,
@@ -125,9 +126,11 @@ class AgentRuntime:
         observation_formatter: Callable[[ToolResult], str] | None = None,
         context_manager: ContextManager | None = None,
         event_bus: EventBus | None = None,
+        metrics: MetricsAccumulator | None = None,
     ) -> None:
         self.registry = registry or InMemorySessionRegistry()
         self.bus = event_bus or EventBus()
+        self.metrics = metrics or MetricsAccumulator.connect(self.bus)
         self._workspaces: dict[str, Path] = {}
         self._active_runs: dict[str, RunControl] = {}
         self._follow_ups: dict[str, FollowUpQueue] = {}
