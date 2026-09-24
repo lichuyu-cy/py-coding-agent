@@ -11,9 +11,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+import hashlib
+import json
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from coding_agent.agent.control import (
     AbortReason,
@@ -25,6 +28,7 @@ from coding_agent.agent.control import (
     UnknownRunError,
 )
 from coding_agent.agent.loop import AgentLoop, LoopObserver, MinimalToolExecutor, RunLimits
+from coding_agent.agent.recovery import workspace_fingerprint
 from coding_agent.context.builder import ContextManager, PromptSection
 from coding_agent.context.compaction import (
     CompactionRecord,
@@ -50,6 +54,15 @@ from coding_agent.domain.messages import (
     utc_now_rfc3339,
 )
 from coding_agent.domain.state import RunStatus, RuntimeState, StateTrigger, StopReason
+from coding_agent.ports.checkpoint import (
+    BoundaryEvent,
+    BoundaryKind,
+    Checkpoint,
+    CheckpointStore,
+    IntentStatus,
+    ToolExecutionStart,
+    ToolIntent,
+)
 from coding_agent.ports.provider import Provider, ToolDefinition
 from coding_agent.ports.store import (
     SessionAppend,
@@ -70,6 +83,12 @@ def _canonical(path: Path) -> str:
         return str(path.resolve())
     except OSError:  # pragma: no cover - 无法规范化时退回原样
         return str(path)
+
+
+def _digest_arguments(arguments: Mapping[str, Any]) -> str:
+    """工具参数摘要（稳定排序的 SHA-256 截断；journal 不落参数原文）。"""
+    payload = json.dumps(dict(arguments), sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
 
 
 class UnknownSessionError(HarnessError):
@@ -158,14 +177,18 @@ class AgentRuntime:
         metrics: MetricsAccumulator | None = None,
         streaming: bool = False,
         session_store: SessionStore | None = None,
+        checkpoint_store: CheckpointStore | None = None,
     ) -> None:
         self.registry = registry or InMemorySessionRegistry()
         # 流式增量属易失事件：慢订阅者丢弃而不阻塞控制路径。
         self.bus = event_bus or EventBus(droppable=[EventType.LLM_REQUEST_STREAM])
         self.metrics = metrics or MetricsAccumulator.connect(self.bus)
         self.session_store = session_store
+        self.checkpoint_store = checkpoint_store
+        checkpoint_enabled = session_store is not None and checkpoint_store is not None
         self._store_versions: dict[str, int] = {}
         self._workspaces: dict[str, Path] = {}
+        self._last_state_seq: dict[str, int] = {}
         self._active_runs: dict[str, RunControl] = {}
         self._follow_ups: dict[str, FollowUpQueue] = {}
         self._context_manager = context_manager
@@ -183,6 +206,8 @@ class AgentRuntime:
             context_manager=context_manager,
             event_bus=self.bus,
             streaming=streaming,
+            boundary_sink=self._on_boundary if checkpoint_enabled else None,
+            tool_start_sink=self._on_tool_start if checkpoint_enabled else None,
         )
 
     async def run(
@@ -395,8 +420,70 @@ class AgentRuntime:
                 SessionAppend(messages=(message_to_dict(message),)),
             )
             self._store_versions[log.session_id] = new_version
+            if self.checkpoint_store is not None:
+                # 意图 journal 是消息事实的投影：计划/完成随提交推进
+                self._record_intents(message)
 
         log.on_append = persist
+
+    def _record_intents(self, message: Message) -> None:
+        """从消息事实投影工具意图：assistant 的调用登记为 planned，结果提交转 completed。"""
+        store = self.checkpoint_store
+        if store is None:  # pragma: no cover - persist 仅在启用检查点时调用
+            return
+        if isinstance(message, AssistantMessage):
+            for call in message.tool_calls:
+                now = utc_now_rfc3339()
+                store.record_intent(
+                    ToolIntent(
+                        intent_id=f"intent_{call.id}",
+                        session_id=message.meta.session_id,
+                        run_id=message.meta.run_id,
+                        call_id=str(call.id),
+                        tool_name=call.name,
+                        arguments_digest=_digest_arguments(call.arguments),
+                        status=IntentStatus.PLANNED,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+        elif isinstance(message, ToolResult):
+            store.complete_intent(message.meta.session_id, str(message.tool_call_id))
+
+    def _on_tool_start(self, event: ToolExecutionStart) -> None:
+        """执行前标记：planned → started（崩溃后即视为副作用未知）。"""
+        store = self.checkpoint_store
+        if store is None:  # pragma: no cover - 仅启用检查点时接线
+            return
+        store.mark_started(event.session_id, event.call_id)
+
+    def _on_boundary(self, event: BoundaryEvent) -> None:
+        """Loop 提交边界 → 保存检查点（索引到当前会话版本）。"""
+        self._last_state_seq[event.session_id] = event.state_seq
+        self._save_checkpoint(event.session_id, event.boundary, event.state_seq)
+
+    def _save_checkpoint(self, session_id: str, boundary: BoundaryKind, state_seq: int) -> None:
+        store = self.checkpoint_store
+        version = self._store_versions.get(session_id)
+        if store is None or version is None:
+            return
+        workspace = self._workspaces.get(session_id)
+        store.save(
+            Checkpoint(
+                checkpoint_id=new_id("ckpt"),
+                session_id=session_id,
+                session_version=version,
+                state_seq=state_seq,
+                boundary=boundary,
+                pending_intent_ids=tuple(
+                    intent.intent_id for intent in store.open_intents(session_id)
+                ),
+                workspace_fingerprint=(
+                    workspace_fingerprint(workspace) if workspace is not None else ""
+                ),
+                created_at=utc_now_rfc3339(),
+            )
+        )
 
     def _persist_summary(self, session_id: str, record: CompactionRecord) -> None:
         """压缩记录写 store（与消息共用版本号；失败向上传播使压缩不被确认）。"""
@@ -408,6 +495,12 @@ class AgentRuntime:
             session_id, expected, SessionAppend(summaries=(summary_record_of(record),))
         )
         self._store_versions[session_id] = new_version
+        if self.checkpoint_store is not None:
+            self._save_checkpoint(
+                session_id,
+                BoundaryKind.COMPACTION,
+                self._last_state_seq.get(session_id, 0),
+            )
 
     def _bind_workspace(self, log: MessageLog, workspace: Path) -> Path:
         """记录会话工作区；store 模式下会话与工作区绑定，拒绝静默切换。"""

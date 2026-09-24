@@ -17,6 +17,7 @@ from coding_agent.context.truncation import ToolOutputTruncator, TruncationPolic
 from coding_agent.domain.messages import ToolResult
 from coding_agent.observability.event_bus import EventBus
 from coding_agent.observability.metrics import MetricsAccumulator
+from coding_agent.ports.checkpoint import CheckpointStore
 from coding_agent.ports.provider import Provider, ToolDefinition
 from coding_agent.ports.store import SessionStore
 from coding_agent.ports.tokenizer import SimpleTokenCounter
@@ -65,6 +66,7 @@ def build_runtime(
     metrics: MetricsAccumulator | None = None,
     streaming: bool = False,
     session_store: SessionStore | None = None,
+    checkpoint_store: CheckpointStore | None = None,
 ) -> AgentRuntime:
     """组装 Runtime：注册表 → 工具声明（快照）→ Pipeline（含安全策略）→ Runtime。"""
     active_registry = registry or build_registry()
@@ -104,4 +106,5 @@ def build_runtime(
         metrics=metrics,
         streaming=streaming,
         session_store=session_store,
+        checkpoint_store=checkpoint_store,
     )

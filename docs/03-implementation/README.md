@@ -31,3 +31,4 @@
 | 17 | [17-streaming.md](17-streaming.md) | `feat: normalize agent stream` |
 | 18 | [18-sse-server.md](18-sse-server.md) | `feat: expose runtime over sse` |
 | 19 | [19-session.md](19-session.md) | `feat: persist sessions` |
+| 20 | [20-checkpoint-resume.md](20-checkpoint-resume.md) | `feat: resume committed state` |

@@ -42,6 +42,7 @@ from coding_agent.domain.state import (
 from coding_agent.domain.events import EventType
 from coding_agent.observability.event_bus import EventBus
 from coding_agent.observability.stream import AgentStreamAggregator
+from coding_agent.ports.checkpoint import BoundaryEvent, BoundaryKind, ToolExecutionStart
 from coding_agent.ports.provider import (
     CancelSignal,
     ModelRequest,
@@ -159,6 +160,8 @@ class AgentLoop:
         context_manager: ContextManager | None = None,
         event_bus: EventBus | None = None,
         streaming: bool = False,
+        boundary_sink: Callable[[BoundaryEvent], None] | None = None,
+        tool_start_sink: Callable[[ToolExecutionStart], None] | None = None,
     ) -> None:
         self._provider = provider
         self._executor = executor
@@ -170,6 +173,8 @@ class AgentLoop:
         self._observation_formatter = observation_formatter
         self._event_bus = event_bus
         self._streaming = streaming
+        self._boundary_sink = boundary_sink
+        self._tool_start_sink = tool_start_sink
         self._context = context_manager or ContextManager(
             ContextPolicy(system_prompt=system_prompt),
             observation_formatter=observation_formatter,
@@ -214,6 +219,19 @@ class AgentLoop:
                     )
                 )
 
+        def boundary(kind: BoundaryKind, message_id: str | None = None) -> None:
+            """在提交/注入边界通知检查点（无 sink 时 no-op，阶段 20 接入）。"""
+            if self._boundary_sink is not None:
+                self._boundary_sink(
+                    BoundaryEvent(
+                        boundary=kind,
+                        state_seq=state.state_seq,
+                        run_id=run_id,
+                        session_id=session_id,
+                        message_id=message_id,
+                    )
+                )
+
         def new_meta() -> MessageMeta:
             return MessageMeta(
                 id=new_message_id(),
@@ -236,6 +254,7 @@ class AgentLoop:
             )
             log.append(result)
             emit(LoopEventKind.TOOL_RESULT_COMMITTED, turn=state.current_turn, message_id=str(result.meta.id))
+            boundary(BoundaryKind.TOOL_RESULT, str(result.meta.id))
 
         def remaining_seconds() -> float | None:
             if self._limits.deadline_seconds is None:
@@ -256,6 +275,7 @@ class AgentLoop:
             message = UserMessage(meta=new_meta(), content=text)
             log.append(message)
             emit(kind, turn=state.current_turn, message_id=str(message.meta.id), detail=detail)
+            boundary(BoundaryKind.USER_TASK, str(message.meta.id))
             if kind is LoopEventKind.STEERING_INJECTED:
                 publish(EventType.STEERING, {"steering_id": detail, "text_length": len(text)})
             elif kind is LoopEventKind.FOLLOW_UP_STARTED:
@@ -400,6 +420,7 @@ class AgentLoop:
             )
             log.append(assistant)
             emit(LoopEventKind.ASSISTANT_COMMITTED, turn=state.current_turn, message_id=str(assistant.meta.id))
+            boundary(BoundaryKind.MODEL_RESPONSE, str(assistant.meta.id))
             usage = response.usage
             publish(
                 EventType.LLM_REQUEST_END,
@@ -492,6 +513,15 @@ class AgentLoop:
                         EventType.TOOL_CALL_START,
                         {"tool_call_id": str(call.id), "name": call.name, "ordinal": call.ordinal},
                     )
+                    if self._tool_start_sink is not None:
+                        # 执行前标记意图：崩溃后据此区分「未开始」与「副作用未知」
+                        self._tool_start_sink(
+                            ToolExecutionStart(
+                                run_id=run_id,
+                                session_id=session_id,
+                                call_id=str(call.id),
+                            )
+                        )
                     outcome = await self._executor.execute(
                         call,
                         workspace=workspace,
@@ -556,6 +586,7 @@ class AgentLoop:
             break
 
         emit(LoopEventKind.RUN_END, turn=state.current_turn, detail=state.state.value)
+        boundary(BoundaryKind.RUN_END)
         publish(
             EventType.AGENT_END,
             {
