@@ -34,3 +34,4 @@
 | 20 | [20-checkpoint-resume.md](20-checkpoint-resume.md) | `feat: resume committed state` |
 | 21 | [21-local-certification.md](21-local-certification.md) | `test: certify local harness` |
 | 22 | [22-swebench-adapter.md](22-swebench-adapter.md) | `feat: add swebench adapter` |
+| 23 | [23-final-evaluation.md](23-final-evaluation.md) | `docs: record final swebench run` |
