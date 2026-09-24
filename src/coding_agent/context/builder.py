@@ -14,8 +14,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
+from coding_agent.context.budget import BudgetDecision, TokenManager
 from coding_agent.domain.errors import HarnessError
 from coding_agent.domain.messages import (
     AssistantMessage,
@@ -29,6 +30,7 @@ from coding_agent.ports.provider import (
     ProviderMessage,
     ProviderMessageRole,
     ProviderToolCallPart,
+    ToolDefinition,
 )
 from coding_agent.ports.tokenizer import SimpleTokenCounter, TokenCounter
 
@@ -122,10 +124,12 @@ class ContextManager:
         *,
         counter: TokenCounter | None = None,
         observation_formatter: Callable[[ToolResult], str] | None = None,
+        token_manager: TokenManager | None = None,
     ) -> None:
         self._policy = policy
         self._counter: TokenCounter = counter or SimpleTokenCounter()
         self._observation_formatter = observation_formatter
+        self._token_manager = token_manager
 
     @property
     def policy(self) -> ContextPolicy:
@@ -136,8 +140,12 @@ class ContextManager:
         log: MessageLog,
         *,
         extra_sections: Sequence[PromptSection] = (),
+        tool_definitions: Sequence[ToolDefinition] = (),
     ) -> ContextSnapshot:
-        """按当前历史构造请求快照；相同输入保证相同输出（确定性）。"""
+        """按当前历史构造请求快照；相同输入保证相同输出（确定性）。
+
+        tool_definitions 参与预算估算（工具声明是请求的固定成本）。
+        """
         messages = log.messages
         self._validate_history(messages)
 
@@ -155,21 +163,28 @@ class ContextManager:
         source_ids = tuple(f"section:{section.name}" for section in sections) + tuple(
             str(message.meta.id) for message in messages
         )
-        estimated = self._estimate(system_content, provider_messages)
-
-        if self._policy.max_tokens is not None and estimated > self._policy.max_tokens:
-            raise ContextError(
-                f"context does not fit the configured budget: estimated {estimated} tokens "
-                f"exceed max_tokens {self._policy.max_tokens}"
-            )
-
-        return ContextSnapshot(
+        provisional = ContextSnapshot(
             messages=provider_messages,
             source_ids=source_ids,
-            estimated_tokens=estimated,
+            estimated_tokens=0,
             sections=tuple(sections),
             summary_version=None,
         )
+        if self._token_manager is not None:
+            estimate = self._token_manager.estimate(provisional, tool_definitions=tool_definitions)
+            if estimate.decision is BudgetDecision.COMPACT:
+                raise ContextError(estimate.explanation)
+            if estimate.decision is BudgetDecision.REJECT:
+                raise ContextError(estimate.explanation)
+            estimated = estimate.total_tokens
+        else:
+            estimated = self._estimate(system_content, provider_messages)
+            if self._policy.max_tokens is not None and estimated > self._policy.max_tokens:
+                raise ContextError(
+                    f"context does not fit the configured budget: estimated {estimated} tokens "
+                    f"exceed max_tokens {self._policy.max_tokens}"
+                )
+        return replace(provisional, estimated_tokens=estimated)
 
     @staticmethod
     def _validate_history(messages: Sequence[Message]) -> None:

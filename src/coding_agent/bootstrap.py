@@ -10,10 +10,12 @@ from collections.abc import Callable, Sequence
 
 from coding_agent.agent.loop import LoopObserver, RunLimits
 from coding_agent.agent.runtime import DEFAULT_SYSTEM_PROMPT, AgentRuntime
-from coding_agent.context.builder import ContextManager
+from coding_agent.context.budget import TokenBudget, TokenManager
+from coding_agent.context.builder import ContextManager, ContextPolicy
 from coding_agent.context.truncation import ToolOutputTruncator, TruncationPolicy
 from coding_agent.domain.messages import ToolResult
 from coding_agent.ports.provider import Provider, ToolDefinition
+from coding_agent.ports.tokenizer import SimpleTokenCounter
 from coding_agent.tools.bash import BashTool
 from coding_agent.tools.edit import EditTool
 from coding_agent.tools.pipeline import ToolPipeline
@@ -53,6 +55,7 @@ def build_runtime(
     observation_formatter: Callable[[ToolResult], str] | None = to_model_observation,
     context_manager: ContextManager | None = None,
     truncation_policy: TruncationPolicy | None = None,
+    context_limit_tokens: int = 128_000,
 ) -> AgentRuntime:
     """组装 Runtime：注册表 → 工具声明（快照）→ Pipeline（含安全策略）→ Runtime。"""
     active_registry = registry or build_registry()
@@ -67,6 +70,16 @@ def build_runtime(
         safety_policy=safety_policy or SafetyPolicy(),
         output_processor=ToolOutputTruncator(policy=truncation_policy or TruncationPolicy()),
     )
+    active_context = context_manager
+    if active_context is None:
+        active_context = ContextManager(
+            ContextPolicy(system_prompt=system_prompt),
+            observation_formatter=observation_formatter,
+            token_manager=TokenManager(
+                SimpleTokenCounter(),
+                budget=TokenBudget(context_limit=context_limit_tokens),
+            ),
+        )
     return AgentRuntime(
         provider=provider,
         executor=active_pipeline,
@@ -76,5 +89,5 @@ def build_runtime(
         tools=definitions,
         model_name=model_name,
         observation_formatter=observation_formatter,
-        context_manager=context_manager,
+        context_manager=active_context,
     )

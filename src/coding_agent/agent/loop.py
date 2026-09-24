@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Protocol
 
 from coding_agent.agent.control import FollowUpQueue, RunControl
-from coding_agent.context.builder import ContextManager, ContextPolicy, PromptSection
+from coding_agent.context.builder import ContextError, ContextManager, ContextPolicy, PromptSection
 from coding_agent.domain.messages import (
     AssistantMessage,
     MessageLog,
@@ -280,7 +280,17 @@ class AgentLoop:
                 )
 
             emit(LoopEventKind.TURN_START, turn=state.current_turn)
-            request = self._build_request(log, extra_sections)
+            try:
+                request = self._build_request(log, extra_sections)
+            except ContextError:
+                # 上下文无法适配（预算不足或需要压缩且不可用）：可解释的预算终止。
+                limit_hit = "context_overflow"
+                state = state.transition(
+                    state.state_seq,
+                    StateTrigger.FINISH,
+                    status=RunStatus.BUDGET_EXHAUSTED,
+                )
+                break
 
             response: ModelResponse | None = None
             provider_error: ProviderError | None = None
@@ -466,5 +476,7 @@ class AgentLoop:
         self, log: MessageLog, extra_sections: Sequence[PromptSection] = ()
     ) -> ModelRequest:
         """经 ContextManager 构造确定性的 Provider 请求（阶段 10 接入）。"""
-        snapshot = self._context.build(log, extra_sections=extra_sections)
+        snapshot = self._context.build(
+            log, extra_sections=extra_sections, tool_definitions=self._tools
+        )
         return ModelRequest(messages=snapshot.messages, tools=self._tools, model=self._model_name)
