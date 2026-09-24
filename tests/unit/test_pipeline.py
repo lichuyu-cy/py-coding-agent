@@ -117,7 +117,7 @@ class SpyProcessor:
     def __init__(self, events: list[str]) -> None:
         self.events = events
 
-    def process(self, outcome: ToolOutcome) -> ToolOutcome:
+    def process(self, outcome: ToolOutcome, invocation: Any) -> ToolOutcome:
         self.events.append("process")
         return ToolOutcome(
             status=outcome.status,

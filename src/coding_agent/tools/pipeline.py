@@ -124,9 +124,9 @@ class ToolPipelineHooks(Protocol):
 
 
 class OutputProcessor(Protocol):
-    """输出处理（阶段 11 的裁剪/artifact 将实现本协议）。"""
+    """输出处理（阶段 11 起由 ToolOutputTruncator 实现：裁剪 + artifact 托管）。"""
 
-    def process(self, outcome: ToolOutcome) -> ToolOutcome: ...
+    def process(self, outcome: ToolOutcome, invocation: "ToolInvocation") -> ToolOutcome: ...
 
 
 class PipelineEventKind(StrEnum):
@@ -240,7 +240,7 @@ class ToolPipeline:
 
         # 8. 输出处理（裁剪/artifact，阶段 11）
         if self._output_processor is not None:
-            processed = self._output_processor.process(outcome)
+            processed = self._output_processor.process(outcome, invocation)
             if processed is not None:
                 outcome = processed
 
