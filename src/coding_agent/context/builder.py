@@ -13,12 +13,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from typing import Any
 
 from coding_agent.context.budget import BudgetDecision, TokenManager
 from coding_agent.context.compaction import CompactionRecord, Compactor, render_summary
 from coding_agent.domain.errors import HarnessError
+from coding_agent.domain.events import EventType
 from coding_agent.domain.messages import (
     AssistantMessage,
     Message,
@@ -145,10 +147,12 @@ class ContextManager:
         *,
         extra_sections: Sequence[PromptSection] = (),
         tool_definitions: Sequence[ToolDefinition] = (),
+        report: Callable[[EventType, Mapping[str, Any]], None] | None = None,
     ) -> ContextSnapshot:
         """按当前历史构造请求快照；相同输入保证相同输出（确定性）。
 
-        tool_definitions 参与预算估算（工具声明是请求的固定成本）。
+        tool_definitions 参与预算估算（工具声明是请求的固定成本）；
+        report 为可选事件回调（CONTEXT_BUILD / COMPACTION_START / COMPACTION_END / ERROR）。
         """
         messages = log.messages
         self._validate_history(messages)
@@ -180,7 +184,9 @@ class ContextManager:
                 # 超过阈值或超窗：先尝试压缩（覆盖部分从请求中移除后再评估）；
                 # 无压缩器时保持显式失败（设计：无法适配时明确报告）。
                 if self._compactor is not None:
-                    return self._compact_and_rebuild(log, sections, tool_definitions, estimate.explanation)
+                    return self._compact_and_rebuild(
+                        log, sections, tool_definitions, estimate.explanation, report
+                    )
                 raise ContextError(estimate.explanation)
             estimated = estimate.total_tokens
         else:
@@ -190,6 +196,15 @@ class ContextManager:
                     f"context does not fit the configured budget: estimated {estimated} tokens "
                     f"exceed max_tokens {self._policy.max_tokens}"
                 )
+        if report is not None:
+            report(
+                EventType.CONTEXT_BUILD,
+                {
+                    "estimated_tokens": estimated,
+                    "message_count": len(provider_messages),
+                    "summary_version": None,
+                },
+            )
         return replace(provisional, estimated_tokens=estimated)
 
     def _compact_and_rebuild(
@@ -198,11 +213,38 @@ class ContextManager:
         sections: Sequence[PromptSection],
         tool_definitions: Sequence[ToolDefinition],
         overflow_explanation: str,
+        report: Callable[[EventType, Mapping[str, Any]], None] | None = None,
     ) -> ContextSnapshot:
         """请求压缩并重建上下文：summary 段 + 未覆盖尾部；成功后才提交记录。"""
         if self._compactor is None:
             raise ContextError(overflow_explanation)
         previous = self._records.get(log.session_id)
+        if report is not None:
+            report(
+                EventType.COMPACTION_START,
+                {
+                    "previous_version": previous.summary_version if previous is not None else 0,
+                    "previous_covered_through": previous.covered_through_id if previous else None,
+                },
+            )
+        try:
+            return self._rebuild_with_compaction(
+                log, sections, tool_definitions, previous, report
+            )
+        except ContextError as err:
+            if report is not None:
+                report(EventType.ERROR, {"stage": "compaction", "reason": str(err)})
+            raise
+
+    def _rebuild_with_compaction(
+        self,
+        log: MessageLog,
+        sections: Sequence[PromptSection],
+        tool_definitions: Sequence[ToolDefinition],
+        previous: CompactionRecord | None,
+        report: Callable[[EventType, Mapping[str, Any]], None] | None,
+    ) -> ContextSnapshot:
+        assert self._compactor is not None
         record = self._compactor.compact(log.messages, old_record=previous)
         if record is None:
             raise ContextError(
@@ -232,6 +274,24 @@ class ContextManager:
         # 原子提交：只有重建成功才保存记录；相同覆盖边界的重算不递增版本
         if previous is None or previous.covered_through_id != record.covered_through_id:
             self._records[log.session_id] = record
+        if report is not None:
+            report(
+                EventType.COMPACTION_END,
+                {
+                    "summary_version": record.summary_version,
+                    "covered_through_id": record.covered_through_id,
+                    "token_before": record.token_before,
+                    "token_after": record.token_after,
+                },
+            )
+            report(
+                EventType.CONTEXT_BUILD,
+                {
+                    "estimated_tokens": estimate.total_tokens,
+                    "message_count": len(provider_messages),
+                    "summary_version": record.summary_version,
+                },
+            )
         return replace(provisional, estimated_tokens=estimate.total_tokens)
 
     @staticmethod

@@ -26,6 +26,7 @@ from coding_agent.agent.loop import AgentLoop, LoopObserver, MinimalToolExecutor
 from coding_agent.context.builder import ContextManager, PromptSection
 from coding_agent.context.skills import SKILLS_DIR, SkillRegistry
 from coding_agent.domain.errors import HarnessError
+from coding_agent.observability.event_bus import EventBus
 from coding_agent.domain.messages import (
     AssistantMessage,
     MessageLog,
@@ -123,8 +124,10 @@ class AgentRuntime:
         model_name: str = "default",
         observation_formatter: Callable[[ToolResult], str] | None = None,
         context_manager: ContextManager | None = None,
+        event_bus: EventBus | None = None,
     ) -> None:
         self.registry = registry or InMemorySessionRegistry()
+        self.bus = event_bus or EventBus()
         self._workspaces: dict[str, Path] = {}
         self._active_runs: dict[str, RunControl] = {}
         self._follow_ups: dict[str, FollowUpQueue] = {}
@@ -138,6 +141,7 @@ class AgentRuntime:
             observer=observer,
             observation_formatter=observation_formatter,
             context_manager=context_manager,
+            event_bus=self.bus,
         )
 
     async def run(

@@ -39,6 +39,8 @@ from coding_agent.domain.state import (
     StateTrigger,
     StopReason,
 )
+from coding_agent.domain.events import EventType
+from coding_agent.observability.event_bus import EventBus
 from coding_agent.ports.provider import (
     CancelSignal,
     ModelRequest,
@@ -149,6 +151,7 @@ class AgentLoop:
         observer: LoopObserver | None = None,
         observation_formatter: Callable[[ToolResult], str] | None = None,
         context_manager: ContextManager | None = None,
+        event_bus: EventBus | None = None,
     ) -> None:
         self._provider = provider
         self._executor = executor
@@ -158,6 +161,7 @@ class AgentLoop:
         self._model_name = model_name
         self._observer = observer
         self._observation_formatter = observation_formatter
+        self._event_bus = event_bus
         self._context = context_manager or ContextManager(
             ContextPolicy(system_prompt=system_prompt),
             observation_formatter=observation_formatter,
@@ -232,21 +236,34 @@ class AgentLoop:
                 asyncio.get_running_loop().time() - started_at
             )
 
+        def publish(event_type: EventType, payload: dict | None = None) -> None:
+            """发布 typed 事件（无总线时为 no-op）；订阅者失败由总线隔离。"""
+            if self._event_bus is not None:
+                self._event_bus.emit(
+                    event_type, run_id=run_id, session_id=session_id, payload=payload or {}
+                )
+
         def inject_user_text(text: str, kind: LoopEventKind, detail: str | None = None) -> None:
             """在下一个模型请求边界前，把控制消息作为 UserMessage 注入历史。"""
             message = UserMessage(meta=new_meta(), content=text)
             log.append(message)
             emit(kind, turn=state.current_turn, message_id=str(message.meta.id), detail=detail)
+            if kind is LoopEventKind.STEERING_INJECTED:
+                publish(EventType.STEERING, {"steering_id": detail, "text_length": len(text)})
+            elif kind is LoopEventKind.FOLLOW_UP_STARTED:
+                publish(EventType.FOLLOW_UP, {"follow_up_id": detail, "text_length": len(text)})
 
         def abort_run(reason: str) -> None:
             """请求已下达的取消：进入 ABORTING→ABORTED（不启动新工具/新请求）。"""
             nonlocal state
+            publish(EventType.ABORT, {"reason": reason})
             state = state.request_abort(reason)
             state = state.transition(
                 state.state_seq, StateTrigger.CLEANUP_DONE, stop_reason=StopReason.CANCELLED
             )
 
         emit(LoopEventKind.RUN_START, turn=state.current_turn)
+        publish(EventType.AGENT_START, {"turn": state.current_turn})
 
         while True:
             # 取消优先级最高：任何活动态在边界处观察到取消都立即终止。
@@ -281,7 +298,7 @@ class AgentLoop:
 
             emit(LoopEventKind.TURN_START, turn=state.current_turn)
             try:
-                request = self._build_request(log, extra_sections)
+                request = self._build_request(log, extra_sections, publish)
             except ContextError:
                 # 上下文无法适配（预算不足或需要压缩且不可用）：可解释的预算终止。
                 limit_hit = "context_overflow"
@@ -292,6 +309,10 @@ class AgentLoop:
                 )
                 break
 
+            publish(
+                EventType.LLM_REQUEST_START,
+                {"request_id": request.request_id, "turn": state.current_turn},
+            )
             response: ModelResponse | None = None
             provider_error: ProviderError | None = None
             deadline_exceeded = False
@@ -325,6 +346,7 @@ class AgentLoop:
                     break
 
             if deadline_exceeded:
+                publish(EventType.ERROR, {"stage": "llm_request", "kind": "timeout"})
                 limit_hit = "deadline"
                 state = state.transition(
                     state.state_seq,
@@ -339,6 +361,10 @@ class AgentLoop:
                 ):
                     abort_run(control.cancel.reason or "provider request cancelled")
                     break
+                publish(
+                    EventType.ERROR,
+                    {"stage": "provider", "kind": provider_error.kind.value},
+                )
                 state = state.transition(
                     state.state_seq, StateTrigger.FAIL, stop_reason=StopReason.PROVIDER_ERROR
                 )
@@ -355,6 +381,17 @@ class AgentLoop:
             )
             log.append(assistant)
             emit(LoopEventKind.ASSISTANT_COMMITTED, turn=state.current_turn, message_id=str(assistant.meta.id))
+            usage = response.usage
+            publish(
+                EventType.LLM_REQUEST_END,
+                {
+                    "request_id": request.request_id,
+                    "response_id": response.response_id,
+                    "stop_reason": stop_reason.value,
+                    "usage_input_tokens": usage.input_tokens if usage is not None else None,
+                    "usage_output_tokens": usage.output_tokens if usage is not None else None,
+                },
+            )
             final_text = response.content
 
             if stop_reason is StopReason.PROVIDER_ERROR:
@@ -390,6 +427,16 @@ class AgentLoop:
                                     retryable=False,
                                 ),
                             )
+                            publish(
+                                EventType.TOOL_CALL_ERROR,
+                                {
+                                    "tool_call_id": str(pending.id),
+                                    "name": pending.name,
+                                    "status": "cancelled",
+                                    "error_kind": "cancelled",
+                                    "executed": False,
+                                },
+                            )
                         aborted_mid_batch = True
                         break
                     if tool_calls_used >= self._limits.max_tool_calls:
@@ -403,6 +450,16 @@ class AgentLoop:
                                     retryable=False,
                                 ),
                             )
+                            publish(
+                                EventType.TOOL_CALL_ERROR,
+                                {
+                                    "tool_call_id": str(pending.id),
+                                    "name": pending.name,
+                                    "status": "cancelled",
+                                    "error_kind": "tool_budget_exhausted",
+                                    "executed": False,
+                                },
+                            )
                         limit_hit = "max_tool_calls"
                         budget_hit = True
                         break
@@ -412,6 +469,10 @@ class AgentLoop:
                             StateTrigger.TOOL_CALL_COMPLETE,
                             tool_call_id=str(call.id),
                         )
+                    publish(
+                        EventType.TOOL_CALL_START,
+                        {"tool_call_id": str(call.id), "name": call.name, "ordinal": call.ordinal},
+                    )
                     outcome = await self._executor.execute(
                         call,
                         workspace=workspace,
@@ -421,6 +482,19 @@ class AgentLoop:
                     tool_calls_used += 1
                     state = state.transition(state.state_seq, StateTrigger.TOOL_RESULT_RESOLVED)
                     commit_result(call, outcome)
+                    publish(
+                        EventType.TOOL_CALL_END
+                        if outcome.status is ToolResultStatus.COMPLETED
+                        else EventType.TOOL_CALL_ERROR,
+                        {
+                            "tool_call_id": str(call.id),
+                            "name": call.name,
+                            "status": outcome.status.value,
+                            "error_kind": outcome.error_kind,
+                            "exit_code": outcome.exit_code,
+                            "retryable": outcome.retryable,
+                        },
+                    )
                     is_last_call = index == len(ordered) - 1
                     if is_last_call and control.steering.has_pending():
                         # 工具结果处理期间到达的 steering：按状态机进入 STEERING，下次请求前注入。
@@ -463,6 +537,16 @@ class AgentLoop:
             break
 
         emit(LoopEventKind.RUN_END, turn=state.current_turn, detail=state.state.value)
+        publish(
+            EventType.AGENT_END,
+            {
+                "status": state.status.value if state.status is not None else None,
+                "limit_hit": limit_hit,
+                "turns": turns,
+                "tool_calls": tool_calls_used,
+                "provider_calls": provider_calls,
+            },
+        )
         return LoopOutcome(
             state=state,
             turns=turns,
@@ -473,10 +557,16 @@ class AgentLoop:
         )
 
     def _build_request(
-        self, log: MessageLog, extra_sections: Sequence[PromptSection] = ()
+        self,
+        log: MessageLog,
+        extra_sections: Sequence[PromptSection] = (),
+        report: Callable[[EventType, dict], None] | None = None,
     ) -> ModelRequest:
         """经 ContextManager 构造确定性的 Provider 请求（阶段 10 接入）。"""
         snapshot = self._context.build(
-            log, extra_sections=extra_sections, tool_definitions=self._tools
+            log,
+            extra_sections=extra_sections,
+            tool_definitions=self._tools,
+            report=(lambda event_type, payload: report(event_type, dict(payload))) if report else None,
         )
         return ModelRequest(messages=snapshot.messages, tools=self._tools, model=self._model_name)
