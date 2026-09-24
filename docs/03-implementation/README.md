@@ -23,3 +23,4 @@
 | 09 | [09-runtime-controls.md](09-runtime-controls.md) | `feat: add runtime controls` |
 | 10 | [10-context-manager.md](10-context-manager.md) | `feat: build provider context` |
 | 11 | [11-tool-output-truncation.md](11-tool-output-truncation.md) | `feat: truncate tool outputs` |
+| 12 | [12-skill-loading.md](12-skill-loading.md) | `feat: load skills on demand` |

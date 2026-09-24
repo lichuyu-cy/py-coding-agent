@@ -13,14 +13,14 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 
 from coding_agent.agent.control import FollowUpQueue, RunControl
-from coding_agent.context.builder import ContextManager, ContextPolicy
+from coding_agent.context.builder import ContextManager, ContextPolicy, PromptSection
 from coding_agent.domain.messages import (
     AssistantMessage,
     MessageLog,
@@ -171,6 +171,7 @@ class AgentLoop:
         workspace: Path,
         control: RunControl | None = None,
         follow_ups: FollowUpQueue | None = None,
+        extra_sections: Sequence[PromptSection] = (),
     ) -> LoopOutcome:
         control = control or RunControl(state.run_id)
         run_id = state.run_id
@@ -279,7 +280,7 @@ class AgentLoop:
                 )
 
             emit(LoopEventKind.TURN_START, turn=state.current_turn)
-            request = self._build_request(log)
+            request = self._build_request(log, extra_sections)
 
             response: ModelResponse | None = None
             provider_error: ProviderError | None = None
@@ -461,7 +462,9 @@ class AgentLoop:
             limit_hit=limit_hit,
         )
 
-    def _build_request(self, log: MessageLog) -> ModelRequest:
+    def _build_request(
+        self, log: MessageLog, extra_sections: Sequence[PromptSection] = ()
+    ) -> ModelRequest:
         """经 ContextManager 构造确定性的 Provider 请求（阶段 10 接入）。"""
-        snapshot = self._context.build(log)
+        snapshot = self._context.build(log, extra_sections=extra_sections)
         return ModelRequest(messages=snapshot.messages, tools=self._tools, model=self._model_name)

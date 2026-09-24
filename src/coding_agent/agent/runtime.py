@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,7 +23,8 @@ from coding_agent.agent.control import (
     UnknownRunError,
 )
 from coding_agent.agent.loop import AgentLoop, LoopObserver, MinimalToolExecutor, RunLimits
-from coding_agent.context.builder import ContextManager
+from coding_agent.context.builder import ContextManager, PromptSection
+from coding_agent.context.skills import SKILLS_DIR, SkillRegistry
 from coding_agent.domain.errors import HarnessError
 from coding_agent.domain.messages import (
     AssistantMessage,
@@ -140,9 +141,16 @@ class AgentRuntime:
         )
 
     async def run(
-        self, task: str, workspace: str | Path, session_id: str | None = None
+        self,
+        task: str,
+        workspace: str | Path,
+        session_id: str | None = None,
+        skills: Sequence[str] | None = None,
     ) -> RunResult:
-        """新建 run：追加用户任务消息，驱动循环，返回最终结果。"""
+        """新建 run：追加用户任务消息，驱动循环，返回最终结果。
+
+        skills 为本次 run 选择的技能名称（正文按需加载）；技能目录不存在时仅无元数据段。
+        """
         if not isinstance(task, str) or not task.strip():
             raise HarnessError("task must be a non-empty string")
         log = (
@@ -155,6 +163,7 @@ class AgentRuntime:
         try:
             resolved_workspace = Path(workspace)
             self._workspaces[log.session_id] = resolved_workspace
+            sections = self._skill_sections(resolved_workspace, skills)
             state = RuntimeState(run_id=new_id("run")).transition(0, StateTrigger.START)
             control = RunControl(state.run_id)
             self._active_runs[control.run_id] = control
@@ -170,6 +179,7 @@ class AgentRuntime:
                     workspace=resolved_workspace,
                     control=control,
                     follow_ups=self._follow_up_queue(log.session_id),
+                    extra_sections=sections,
                 )
             finally:
                 self._active_runs.pop(control.run_id, None)
@@ -178,7 +188,10 @@ class AgentRuntime:
             self.registry.release(log.session_id)
 
     async def continue_run(
-        self, session_id: str, workspace: str | Path | None = None
+        self,
+        session_id: str,
+        workspace: str | Path | None = None,
+        skills: Sequence[str] | None = None,
     ) -> RunResult:
         """从已提交历史继续（不追加用户消息）；尾部必须合法。
 
@@ -194,6 +207,7 @@ class AgentRuntime:
         if not self.registry.try_acquire(session_id):
             raise RunConflictError(f"session {session_id!r} already has an active run")
         try:
+            sections = self._skill_sections(resolved, skills)
             state = RuntimeState(run_id=new_id("run")).transition(0, StateTrigger.START)
             control = RunControl(state.run_id)
             self._active_runs[control.run_id] = control
@@ -204,6 +218,7 @@ class AgentRuntime:
                     workspace=resolved,
                     control=control,
                     follow_ups=self._follow_up_queue(session_id),
+                    extra_sections=sections,
                 )
             finally:
                 self._active_runs.pop(control.run_id, None)
@@ -249,6 +264,21 @@ class AgentRuntime:
             queue = FollowUpQueue()
             self._follow_ups[session_id] = queue
         return queue
+
+    @staticmethod
+    def _skill_sections(workspace: Path, skills: Sequence[str] | None) -> tuple[PromptSection, ...]:
+        """发现技能并组装段落：元数据常驻，正文仅按选择加载。"""
+        registry = SkillRegistry([workspace / SKILLS_DIR])
+        sections: list[PromptSection] = []
+        metadata_section = registry.metadata_section()
+        if metadata_section is not None:
+            sections.append(metadata_section)
+        if skills:
+            for body in registry.select_for_turn(skills):
+                sections.append(
+                    PromptSection(name=f"skill:{body.metadata.name}", content=body.content)
+                )
+        return tuple(sections)
 
     @staticmethod
     def _new_meta(log: MessageLog, state: RuntimeState) -> MessageMeta:
