@@ -1,10 +1,12 @@
-"""Runtime：run 的生命周期、会话注册与运行锁、结果包装。
+"""Runtime：run 的生命周期、会话注册与运行锁、会话持久化与结果包装。
 
 阶段 04 范围：
 - `run(task, workspace, session_id?)` 与 `continue_run(session_id)` 入口；
-- 内存会话注册表（阶段 19 由持久 SessionStore 取代）与每会话独占运行锁
-  （补足阶段 02 记录的“无两个活动运行写同一 Session”）；
+- 内存会话注册表与每会话独占运行锁（补足阶段 02 记录的“无两个活动运行写同一 Session”）；
 - 一切持久写入经 MessageLog；Runtime 是 RuntimeState 的唯一写者。
+
+阶段 19：session_store 存在时——消息逐条原子落库、新会话创建持久记录、
+未命中会话从 store 水合（含最新摘要）、store 运行锁跨实例互斥、workspace 绑定校验。
 """
 
 from __future__ import annotations
@@ -24,6 +26,11 @@ from coding_agent.agent.control import (
 )
 from coding_agent.agent.loop import AgentLoop, LoopObserver, MinimalToolExecutor, RunLimits
 from coding_agent.context.builder import ContextManager, PromptSection
+from coding_agent.context.compaction import (
+    CompactionRecord,
+    compaction_record_from_store,
+    summary_record_of,
+)
 from coding_agent.context.skills import SKILLS_DIR, SkillRegistry
 from coding_agent.domain.errors import HarnessError
 from coding_agent.domain.events import EventType
@@ -31,21 +38,38 @@ from coding_agent.observability.event_bus import EventBus
 from coding_agent.observability.metrics import MetricsAccumulator
 from coding_agent.domain.messages import (
     AssistantMessage,
+    Message,
     MessageLog,
     MessageMeta,
     ToolResult,
     UserMessage,
+    message_from_dict,
+    message_to_dict,
     new_id,
     new_message_id,
     utc_now_rfc3339,
 )
 from coding_agent.domain.state import RunStatus, RuntimeState, StateTrigger, StopReason
 from coding_agent.ports.provider import Provider, ToolDefinition
+from coding_agent.ports.store import (
+    SessionAppend,
+    SessionRecord,
+    SessionStore,
+    UnknownSessionRecordError,
+)
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a coding agent. You inspect and modify the workspace using the provided tools, "
     "then answer the user's request with a concise report."
 )
+
+
+def _canonical(path: Path) -> str:
+    """工作区路径规范化（大小写/相对路径差异不视为换目录）。"""
+    try:
+        return str(path.resolve())
+    except OSError:  # pragma: no cover - 无法规范化时退回原样
+        return str(path)
 
 
 class UnknownSessionError(HarnessError):
@@ -54,6 +78,10 @@ class UnknownSessionError(HarnessError):
 
 class RunConflictError(HarnessError):
     """同一会话已有活动 run：拒绝第二个写者。"""
+
+
+class WorkspaceMismatchError(HarnessError):
+    """store 模式下会话与工作区绑定：拒绝静默切换目录。"""
 
 
 class ResumeValidationError(HarnessError):
@@ -129,14 +157,20 @@ class AgentRuntime:
         event_bus: EventBus | None = None,
         metrics: MetricsAccumulator | None = None,
         streaming: bool = False,
+        session_store: SessionStore | None = None,
     ) -> None:
         self.registry = registry or InMemorySessionRegistry()
         # 流式增量属易失事件：慢订阅者丢弃而不阻塞控制路径。
         self.bus = event_bus or EventBus(droppable=[EventType.LLM_REQUEST_STREAM])
         self.metrics = metrics or MetricsAccumulator.connect(self.bus)
+        self.session_store = session_store
+        self._store_versions: dict[str, int] = {}
         self._workspaces: dict[str, Path] = {}
         self._active_runs: dict[str, RunControl] = {}
         self._follow_ups: dict[str, FollowUpQueue] = {}
+        self._context_manager = context_manager
+        if context_manager is not None and session_store is not None:
+            context_manager.set_record_sink(self._persist_summary)
         self._loop = AgentLoop(
             provider=provider,
             executor=executor,
@@ -167,37 +201,44 @@ class AgentRuntime:
         """
         if not isinstance(task, str) or not task.strip():
             raise HarnessError("task must be a non-empty string")
-        log = (
-            self.registry.get(session_id)
-            if session_id is not None
-            else self.registry.create_session()
-        )
+        if session_id is not None:
+            log = self._get_session_log(session_id)
+        else:
+            log = self._create_session_log(Path(workspace))
         if not self.registry.try_acquire(log.session_id):
             raise RunConflictError(f"session {log.session_id!r} already has an active run")
         try:
-            resolved_workspace = Path(workspace)
-            self._workspaces[log.session_id] = resolved_workspace
-            sections = self._skill_sections(resolved_workspace, skills)
-            state = RuntimeState(run_id=run_id or new_id("run")).transition(0, StateTrigger.START)
-            control = RunControl(state.run_id, log.session_id)
-            self._active_runs[control.run_id] = control
-            user_message = UserMessage(
-                meta=self._new_meta(log, state),
-                content=task,
-            )
-            log.append(user_message)
-            try:
-                outcome = await self._loop.run(
-                    log=log,
-                    state=state,
-                    workspace=resolved_workspace,
-                    control=control,
-                    follow_ups=self._follow_up_queue(log.session_id),
-                    extra_sections=sections,
+            resolved_workspace = self._bind_workspace(log, Path(workspace))
+            resolved_run_id = run_id or new_id("run")
+            if not self._acquire_store_lock(log.session_id, resolved_run_id):
+                raise RunConflictError(
+                    f"session {log.session_id!r} is locked by another runtime"
+                    " (store run lock held)"
                 )
+            try:
+                sections = self._skill_sections(resolved_workspace, skills)
+                state = RuntimeState(run_id=resolved_run_id).transition(0, StateTrigger.START)
+                control = RunControl(state.run_id, log.session_id)
+                self._active_runs[control.run_id] = control
+                user_message = UserMessage(
+                    meta=self._new_meta(log, state),
+                    content=task,
+                )
+                log.append(user_message)
+                try:
+                    outcome = await self._loop.run(
+                        log=log,
+                        state=state,
+                        workspace=resolved_workspace,
+                        control=control,
+                        follow_ups=self._follow_up_queue(log.session_id),
+                        extra_sections=sections,
+                    )
+                finally:
+                    self._active_runs.pop(control.run_id, None)
+                return self._to_result(log, outcome.state, outcome.turns, outcome.tool_calls, outcome.provider_calls, outcome.final_text, outcome.limit_hit)
             finally:
-                self._active_runs.pop(control.run_id, None)
-            return self._to_result(log, outcome.state, outcome.turns, outcome.tool_calls, outcome.provider_calls, outcome.final_text, outcome.limit_hit)
+                self._release_store_lock(log.session_id, resolved_run_id)
         finally:
             self.registry.release(log.session_id)
 
@@ -209,34 +250,45 @@ class AgentRuntime:
     ) -> RunResult:
         """从已提交历史继续（不追加用户消息）；尾部必须合法。
 
-        workspace 优先使用显式传入值，否则回退到该会话上一次 run 记录的工作区。
+        workspace 优先使用显式传入值，否则回退到该会话已记录的工作区
+        （store 模式下来自持久记录的绑定工作区）。
         """
-        log = self.registry.get(session_id)
+        log = self._get_session_log(session_id)
         self._validate_tail(log)
         resolved = Path(workspace) if workspace is not None else self._workspaces.get(session_id)
         if resolved is None:
             raise UnknownSessionError(
                 f"session {session_id!r} has no recorded workspace; pass workspace explicitly"
             )
+        resolved = self._bind_workspace(log, resolved)
         if not self.registry.try_acquire(session_id):
             raise RunConflictError(f"session {session_id!r} already has an active run")
         try:
-            sections = self._skill_sections(resolved, skills)
-            state = RuntimeState(run_id=new_id("run")).transition(0, StateTrigger.START)
-            control = RunControl(state.run_id, session_id)
-            self._active_runs[control.run_id] = control
-            try:
-                outcome = await self._loop.run(
-                    log=log,
-                    state=state,
-                    workspace=resolved,
-                    control=control,
-                    follow_ups=self._follow_up_queue(session_id),
-                    extra_sections=sections,
+            resolved_run_id = new_id("run")
+            if not self._acquire_store_lock(session_id, resolved_run_id):
+                raise RunConflictError(
+                    f"session {session_id!r} is locked by another runtime"
+                    " (store run lock held)"
                 )
+            try:
+                sections = self._skill_sections(resolved, skills)
+                state = RuntimeState(run_id=resolved_run_id).transition(0, StateTrigger.START)
+                control = RunControl(state.run_id, session_id)
+                self._active_runs[control.run_id] = control
+                try:
+                    outcome = await self._loop.run(
+                        log=log,
+                        state=state,
+                        workspace=resolved,
+                        control=control,
+                        follow_ups=self._follow_up_queue(session_id),
+                        extra_sections=sections,
+                    )
+                finally:
+                    self._active_runs.pop(control.run_id, None)
+                return self._to_result(log, outcome.state, outcome.turns, outcome.tool_calls, outcome.provider_calls, outcome.final_text, outcome.limit_hit)
             finally:
-                self._active_runs.pop(control.run_id, None)
-            return self._to_result(log, outcome.state, outcome.turns, outcome.tool_calls, outcome.provider_calls, outcome.final_text, outcome.limit_hit)
+                self._release_store_lock(session_id, resolved_run_id)
         finally:
             self.registry.release(session_id)
 
@@ -278,6 +330,109 @@ class AgentRuntime:
             queue = FollowUpQueue()
             self._follow_ups[session_id] = queue
         return queue
+
+    # ---- 会话持久化（阶段 19） ----
+
+    def _create_session_log(self, workspace: Path) -> MessageLog:
+        """新会话：store 模式下先创建持久记录并逐条落库；否则退回内存注册表。"""
+        if self.session_store is None:
+            log = self.registry.create_session()
+            self._workspaces[log.session_id] = workspace
+            return log
+        record = self.session_store.create(workspace)
+        log = MessageLog(record.session_id)
+        self.registry.register(log)
+        self._workspaces[record.session_id] = workspace
+        self._attach_persistence(log, record.version)
+        return log
+
+    def _get_session_log(self, session_id: str) -> MessageLog:
+        """获取会话：内存命中直接返回；store 模式未命中时从持久记录水合。"""
+        try:
+            return self.registry.get(session_id)
+        except UnknownSessionError:
+            pass
+        if self.session_store is None:
+            raise UnknownSessionError(f"unknown session {session_id!r}")
+        try:
+            record = self.session_store.load(session_id)
+        except UnknownSessionRecordError as exc:
+            raise UnknownSessionError(f"unknown session {session_id!r}") from exc
+        log = MessageLog(record.session_id)
+        for payload in record.messages:
+            log.append(message_from_dict(payload))
+        try:
+            self.registry.register(log)
+        except HarnessError:
+            # 并发水合竞态：退回已注册实例，保证持久化回调只挂一次
+            return self.registry.get(session_id)
+        self._workspaces.setdefault(session_id, Path(record.workspace))
+        self._restore_compaction(session_id, record)
+        self._attach_persistence(log, record.version)
+        return log
+
+    def _restore_compaction(self, session_id: str, record: SessionRecord) -> None:
+        """把最新持久摘要回填上下文管理器：重启后压缩版本继续单调。"""
+        if self._context_manager is None or not record.summaries:
+            return
+        latest = max(record.summaries, key=lambda item: item.summary_version)
+        self._context_manager.restore_record(session_id, compaction_record_from_store(latest))
+
+    def _attach_persistence(self, log: MessageLog, version: int) -> None:
+        """逐条消息同步落库（append-only 与事实日志同序）；版本号乐观推进。"""
+        if self.session_store is None:
+            return
+        self._store_versions[log.session_id] = version
+
+        def persist(message: Message) -> None:
+            store = self.session_store
+            if store is None:  # pragma: no cover - attach 仅在有 store 时执行
+                return
+            expected = self._store_versions[log.session_id]
+            new_version = store.append(
+                log.session_id,
+                expected,
+                SessionAppend(messages=(message_to_dict(message),)),
+            )
+            self._store_versions[log.session_id] = new_version
+
+        log.on_append = persist
+
+    def _persist_summary(self, session_id: str, record: CompactionRecord) -> None:
+        """压缩记录写 store（与消息共用版本号；失败向上传播使压缩不被确认）。"""
+        store = self.session_store
+        if store is None:  # pragma: no cover - sink 仅在有 store 时注入
+            return
+        expected = self._store_versions.get(session_id, 0)
+        new_version = store.append(
+            session_id, expected, SessionAppend(summaries=(summary_record_of(record),))
+        )
+        self._store_versions[session_id] = new_version
+
+    def _bind_workspace(self, log: MessageLog, workspace: Path) -> Path:
+        """记录会话工作区；store 模式下会话与工作区绑定，拒绝静默切换。"""
+        recorded = self._workspaces.get(log.session_id)
+        if (
+            self.session_store is not None
+            and recorded is not None
+            and _canonical(recorded) != _canonical(workspace)
+        ):
+            raise WorkspaceMismatchError(
+                f"session {log.session_id!r} is bound to workspace {str(recorded)!r},"
+                f" got {str(workspace)!r}"
+            )
+        self._workspaces[log.session_id] = workspace
+        return workspace
+
+    def _acquire_store_lock(self, session_id: str, run_id: str) -> bool:
+        if self.session_store is None:
+            return True
+        return self.session_store.acquire_run_lock(session_id, run_id)
+
+    def _release_store_lock(self, session_id: str, run_id: str) -> None:
+        if self.session_store is None:
+            return
+        self.session_store.release_run_lock(session_id, run_id)
 
     # ---- 只读查询（供 Server / 诊断使用） ----
 

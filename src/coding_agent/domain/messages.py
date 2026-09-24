@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -312,9 +312,12 @@ class MessageLog:
 
     输入：待追加的消息；输出：经过验证的记录与查询接口。
     调用方：Runtime 写入；Context、Session、Compaction 只读消费。
+    on_append 可选：追加成功后的同步观察者（阶段 19 用于持久化；异常向上传播）。
     """
 
-    def __init__(self, session_id: str) -> None:
+    def __init__(
+        self, session_id: str, *, on_append: Callable[["Message"], None] | None = None
+    ) -> None:
         if not isinstance(session_id, str) or not session_id:
             raise MessageValidationError("malformed_message", "session_id must be a non-empty string")
         self._session_id = session_id
@@ -322,6 +325,7 @@ class MessageLog:
         self._message_ids: set[str] = set()
         self._tool_calls: dict[str, ToolCall] = {}
         self._results: dict[str, ToolResult] = {}
+        self.on_append = on_append
 
     @property
     def session_id(self) -> str:
@@ -345,6 +349,8 @@ class MessageLog:
                 self._tool_calls[str(call.id)] = call
         elif isinstance(message, ToolResult):
             self._results[str(message.tool_call_id)] = message
+        if self.on_append is not None:
+            self.on_append(message)
 
     def _validate(self, message: Message) -> None:
         if not isinstance(message, (SystemMessage, UserMessage, AssistantMessage, ToolResult)):

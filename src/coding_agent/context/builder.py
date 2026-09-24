@@ -129,17 +129,30 @@ class ContextManager:
         observation_formatter: Callable[[ToolResult], str] | None = None,
         token_manager: TokenManager | None = None,
         compactor: Compactor | None = None,
+        record_sink: Callable[[str, CompactionRecord], None] | None = None,
     ) -> None:
         self._policy = policy
         self._counter: TokenCounter = counter or SimpleTokenCounter()
         self._observation_formatter = observation_formatter
         self._token_manager = token_manager
         self._compactor = compactor
+        self._record_sink = record_sink
         self._records: dict[str, CompactionRecord] = {}  # 会话 → 已提交压缩记录（阶段 19 持久化）
 
     @property
     def policy(self) -> ContextPolicy:
         return self._policy
+
+    def set_record_sink(self, sink: Callable[[str, CompactionRecord], None] | None) -> None:
+        """注入压缩记录的持久化写入器（阶段 19 Runtime 接入；提交前调用，异常向上传播）。"""
+        self._record_sink = sink
+
+    def restore_record(self, session_id: str, record: CompactionRecord) -> None:
+        """恢复已持久化的压缩记录（阶段 19 重启水合；同一会话只保留最新版本）。"""
+        existing = self._records.get(session_id)
+        if existing is not None and existing.summary_version >= record.summary_version:
+            return
+        self._records[session_id] = record
 
     def build(
         self,
@@ -271,8 +284,11 @@ class ContextManager:
         estimate = self._token_manager.estimate(provisional, tool_definitions=tool_definitions)
         if estimate.decision is BudgetDecision.REJECT:
             raise ContextError(f"context still does not fit after compaction: {estimate.explanation}")
-        # 原子提交：只有重建成功才保存记录；相同覆盖边界的重算不递增版本
+        # 原子提交：只有重建成功才保存记录（持久化 sink 先行，失败则不提交内存记录）；
+        # 相同覆盖边界的重算不递增版本
         if previous is None or previous.covered_through_id != record.covered_through_id:
+            if self._record_sink is not None:
+                self._record_sink(log.session_id, record)
             self._records[log.session_id] = record
         if report is not None:
             report(

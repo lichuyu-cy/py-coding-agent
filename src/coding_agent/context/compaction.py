@@ -15,8 +15,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from coding_agent.domain.errors import HarnessError
 from coding_agent.domain.messages import (
@@ -26,6 +27,7 @@ from coding_agent.domain.messages import (
     ToolResultStatus,
     UserMessage,
 )
+from coding_agent.ports.store import SummaryRecord
 from coding_agent.ports.tokenizer import SimpleTokenCounter, TokenCounter
 
 __all__ = [
@@ -35,10 +37,14 @@ __all__ = [
     "CutPlan",
     "MessageGroup",
     "StructuredSummary",
+    "compaction_record_from_store",
     "extract_summary",
     "find_cut",
     "group_messages",
     "render_summary",
+    "summary_from_payload",
+    "summary_payload",
+    "summary_record_of",
 ]
 
 _UNKNOWN = "unknown"
@@ -256,6 +262,77 @@ def render_summary(summary: StructuredSummary) -> str:
         lines.append(f"unknown_fields: {', '.join(summary.unknown_fields)}")
     lines.append(f"source_ids: {', '.join(summary.source_ids)}")
     return "\n".join(lines)
+
+
+def summary_payload(summary: StructuredSummary) -> dict[str, Any]:
+    """结构化摘要 → JSON 友好载荷（阶段 19 持久化；与 summary_from_payload 互逆）。"""
+    return {
+        "task_goal": summary.task_goal,
+        "current_progress": summary.current_progress,
+        "completed_work": summary.completed_work,
+        "pending_work": summary.pending_work,
+        "files_read": list(summary.files_read),
+        "files_modified": list(summary.files_modified),
+        "commands_executed": list(summary.commands_executed),
+        "test_results": summary.test_results,
+        "errors": list(summary.errors),
+        "important_decisions": summary.important_decisions,
+        "next_step": summary.next_step,
+        "source_ids": list(summary.source_ids),
+        "unknown_fields": list(summary.unknown_fields),
+    }
+
+
+def summary_from_payload(fields: Mapping[str, Any]) -> StructuredSummary:
+    """持久化载荷 → 结构化摘要；缺失字段回退 'unknown'（向前兼容读取）。"""
+
+    def _text(name: str) -> str:
+        value = fields.get(name, _UNKNOWN)
+        return value if isinstance(value, str) else str(value)
+
+    def _items(name: str) -> tuple[str, ...]:
+        value = fields.get(name, ())
+        if not isinstance(value, (list, tuple)):
+            return ()
+        return tuple(str(item) for item in value)
+
+    return StructuredSummary(
+        task_goal=_text("task_goal"),
+        current_progress=_text("current_progress"),
+        completed_work=_text("completed_work"),
+        pending_work=_text("pending_work"),
+        files_read=_items("files_read"),
+        files_modified=_items("files_modified"),
+        commands_executed=_items("commands_executed"),
+        test_results=_text("test_results"),
+        errors=_items("errors"),
+        important_decisions=_text("important_decisions"),
+        next_step=_text("next_step"),
+        source_ids=_items("source_ids"),
+        unknown_fields=_items("unknown_fields"),
+    )
+
+
+def summary_record_of(record: CompactionRecord) -> SummaryRecord:
+    """内存 CompactionRecord → 持久化 SummaryRecord（阶段 19 写路径）。"""
+    return SummaryRecord(
+        summary_version=record.summary_version,
+        covered_through_id=record.covered_through_id,
+        structured_fields=summary_payload(record.summary),
+        source_ids=record.summary.source_ids,
+    )
+
+
+def compaction_record_from_store(record: SummaryRecord) -> CompactionRecord:
+    """持久化 SummaryRecord → 内存 CompactionRecord（重启水合；token 对比值不持久化）。"""
+    return CompactionRecord(
+        summary=summary_from_payload(record.structured_fields),
+        covered_through_id=record.covered_through_id,
+        preserved_ids=(),
+        token_before=0,
+        token_after=0,
+        summary_version=record.summary_version,
+    )
 
 
 class Compactor:

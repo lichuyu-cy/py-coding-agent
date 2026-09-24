@@ -18,6 +18,7 @@ from coding_agent.domain.messages import ToolResult
 from coding_agent.observability.event_bus import EventBus
 from coding_agent.observability.metrics import MetricsAccumulator
 from coding_agent.ports.provider import Provider, ToolDefinition
+from coding_agent.ports.store import SessionStore
 from coding_agent.ports.tokenizer import SimpleTokenCounter
 from coding_agent.tools.bash import BashTool
 from coding_agent.tools.edit import EditTool
@@ -63,6 +64,7 @@ def build_runtime(
     event_bus: EventBus | None = None,
     metrics: MetricsAccumulator | None = None,
     streaming: bool = False,
+    session_store: SessionStore | None = None,
 ) -> AgentRuntime:
     """组装 Runtime：注册表 → 工具声明（快照）→ Pipeline（含安全策略）→ Runtime。"""
     active_registry = registry or build_registry()
@@ -101,4 +103,5 @@ def build_runtime(
         event_bus=event_bus,
         metrics=metrics,
         streaming=streaming,
+        session_store=session_store,
     )
