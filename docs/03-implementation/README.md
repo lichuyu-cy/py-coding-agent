@@ -28,3 +28,4 @@
 | 14 | [14-compaction.md](14-compaction.md) | `feat: compact context safely` |
 | 15 | [15-event-bus.md](15-event-bus.md) | `feat: publish agent events` |
 | 16 | [16-metrics-logging.md](16-metrics-logging.md) | `feat: record metrics and logs` |
+| 17 | [17-streaming.md](17-streaming.md) | `feat: normalize agent stream` |
