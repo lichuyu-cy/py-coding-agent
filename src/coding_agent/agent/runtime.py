@@ -157,10 +157,13 @@ class AgentRuntime:
         workspace: str | Path,
         session_id: str | None = None,
         skills: Sequence[str] | None = None,
+        *,
+        run_id: str | None = None,
     ) -> RunResult:
         """新建 run：追加用户任务消息，驱动循环，返回最终结果。
 
         skills 为本次 run 选择的技能名称（正文按需加载）；技能目录不存在时仅无元数据段。
+        run_id 可选：入口（如 Server）希望提前获知 run 标识时传入。
         """
         if not isinstance(task, str) or not task.strip():
             raise HarnessError("task must be a non-empty string")
@@ -175,8 +178,8 @@ class AgentRuntime:
             resolved_workspace = Path(workspace)
             self._workspaces[log.session_id] = resolved_workspace
             sections = self._skill_sections(resolved_workspace, skills)
-            state = RuntimeState(run_id=new_id("run")).transition(0, StateTrigger.START)
-            control = RunControl(state.run_id)
+            state = RuntimeState(run_id=run_id or new_id("run")).transition(0, StateTrigger.START)
+            control = RunControl(state.run_id, log.session_id)
             self._active_runs[control.run_id] = control
             user_message = UserMessage(
                 meta=self._new_meta(log, state),
@@ -220,7 +223,7 @@ class AgentRuntime:
         try:
             sections = self._skill_sections(resolved, skills)
             state = RuntimeState(run_id=new_id("run")).transition(0, StateTrigger.START)
-            control = RunControl(state.run_id)
+            control = RunControl(state.run_id, session_id)
             self._active_runs[control.run_id] = control
             try:
                 outcome = await self._loop.run(
@@ -275,6 +278,22 @@ class AgentRuntime:
             queue = FollowUpQueue()
             self._follow_ups[session_id] = queue
         return queue
+
+    # ---- 只读查询（供 Server / 诊断使用） ----
+
+    def active_run_ids(self) -> frozenset[str]:
+        return frozenset(self._active_runs)
+
+    def active_run_id(self, session_id: str) -> str | None:
+        """某会话当前活动 run 的 ID（无则 None）。"""
+        for control in self._active_runs.values():
+            if control.session_id == session_id:
+                return control.run_id
+        return None
+
+    def workspace_of(self, session_id: str) -> Path | None:
+        """该会话最近一次 run 使用的工作区（未记录则 None）。"""
+        return self._workspaces.get(session_id)
 
     @staticmethod
     def _skill_sections(workspace: Path, skills: Sequence[str] | None) -> tuple[PromptSection, ...]:

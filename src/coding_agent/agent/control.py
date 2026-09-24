@@ -189,7 +189,8 @@ class FollowUpQueue:
 class RunControl:
     """一次 run 的控制通道；由 Runtime 创建并在 run 结束后关闭（从活动表移除）。"""
 
-    def __init__(self, run_id: str) -> None:
+    def __init__(self, run_id: str, session_id: str = "") -> None:
         self.run_id = run_id
+        self.session_id = session_id
         self.cancel = CancelToken()
         self.steering = SteeringQueue()
