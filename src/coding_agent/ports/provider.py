@@ -116,6 +116,16 @@ class ToolCallDelta:
 
 
 @dataclass(frozen=True, slots=True)
+class ToolCallFragmentDelta:
+    """工具调用的参数分片（真实 Provider 形态）：同一 call 内按 fragment_seq 排序。"""
+
+    call_id: str
+    arguments_fragment: str
+    fragment_seq: int
+    name: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class UsageDelta:
     usage: TokenUsage
 
@@ -125,7 +135,7 @@ class StopDelta:
     stop_reason: StopReason
 
 
-ModelDelta = TextDelta | ToolCallDelta | UsageDelta | StopDelta
+ModelDelta = TextDelta | ToolCallDelta | ToolCallFragmentDelta | UsageDelta | StopDelta
 
 
 class CancelSignal(Protocol):

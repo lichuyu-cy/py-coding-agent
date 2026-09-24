@@ -21,6 +21,7 @@ class EventType(StrEnum):
     AGENT_START = "agent_start"
     AGENT_END = "agent_end"
     LLM_REQUEST_START = "llm_request_start"
+    LLM_REQUEST_STREAM = "llm_request_stream"  # 易失增量事件（可丢弃）
     LLM_REQUEST_END = "llm_request_end"
     TOOL_CALL_START = "tool_call_start"
     TOOL_CALL_END = "tool_call_end"

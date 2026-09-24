@@ -62,6 +62,7 @@ def build_runtime(
     compactor: Compactor | None = None,
     event_bus: EventBus | None = None,
     metrics: MetricsAccumulator | None = None,
+    streaming: bool = False,
 ) -> AgentRuntime:
     """组装 Runtime：注册表 → 工具声明（快照）→ Pipeline（含安全策略）→ Runtime。"""
     active_registry = registry or build_registry()
@@ -99,4 +100,5 @@ def build_runtime(
         context_manager=active_context,
         event_bus=event_bus,
         metrics=metrics,
+        streaming=streaming,
     )

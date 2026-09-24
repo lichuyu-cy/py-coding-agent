@@ -28,6 +28,7 @@ from coding_agent.ports.provider import (
     TextDelta,
     TokenUsage,
     ToolCallDelta,
+    ToolCallFragmentDelta,
     UsageDelta,
     validate_model_request,
     validate_model_response,
@@ -38,20 +39,26 @@ _CANCEL_POLL_SECONDS = 0.01
 
 @dataclass(frozen=True, slots=True)
 class ScriptedToolCall:
-    """脚本化工具调用；arguments 与 arguments_json 二选一。
+    """脚本化工具调用；arguments / arguments_json / arguments_json_chunks 三选一。
 
-    arguments_json 用于模拟真实 Provider 的原始 JSON 分片/损坏场景。
+    arguments_json 用于模拟真实 Provider 的原始 JSON 分片/损坏场景；
+    arguments_json_chunks 用于模拟流式分片参数（stream() 按序产出片段）。
     """
 
     name: str
     arguments: Mapping[str, Any] | None = None
     arguments_json: str | None = None
+    arguments_json_chunks: tuple[str, ...] | None = None
     id: str | None = None  # 缺省时由 Fake 生成唯一 ID
 
 
 @dataclass(frozen=True, slots=True)
 class FakeResponse:
-    """脚本化成功响应。content_chunks 供 stream() 切分文本。"""
+    """脚本化成功响应。content_chunks 供 stream() 切分文本。
+
+    truncate_stream=True 时 stream() 在产出部分增量后提前结束（无 StopDelta），
+    用于模拟流中断（不得把半段调用送入工具）。
+    """
 
     content: str = ""
     stop_reason: StopReason = StopReason.END_TURN
@@ -59,6 +66,7 @@ class FakeResponse:
     usage: TokenUsage | None = None
     delay_seconds: float = 0.0
     content_chunks: tuple[str, ...] | None = None
+    truncate_stream: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,8 +141,19 @@ class FakeProvider:
             chunks = ()
         for chunk in chunks:
             yield TextDelta(chunk)
-        for call in response.tool_calls:
-            yield ToolCallDelta(call)
+        for scripted, call in zip(step.tool_calls, response.tool_calls):
+            if scripted.arguments_json_chunks is not None:
+                for sequence, fragment in enumerate(scripted.arguments_json_chunks):
+                    yield ToolCallFragmentDelta(
+                        call_id=str(call.id),
+                        arguments_fragment=fragment,
+                        fragment_seq=sequence,
+                        name=call.name,
+                    )
+            else:
+                yield ToolCallDelta(call)
+        if step.truncate_stream:
+            return  # 模拟流中断：无 usage / 无 StopDelta
         if response.usage is not None:
             yield UsageDelta(response.usage)
         yield StopDelta(response.stop_reason)
@@ -182,9 +201,12 @@ class FakeProvider:
     @staticmethod
     def _build_tool_call(scripted: ScriptedToolCall, ordinal: int) -> ToolCall:
         call_id = scripted.id if scripted.id is not None else str(new_tool_call_id())
-        if scripted.arguments_json is not None:
+        raw_json = scripted.arguments_json
+        if raw_json is None and scripted.arguments_json_chunks is not None:
+            raw_json = "".join(scripted.arguments_json_chunks)
+        if raw_json is not None:
             try:
-                parsed: Any = json.loads(scripted.arguments_json)
+                parsed: Any = json.loads(raw_json)
             except json.JSONDecodeError as exc:
                 raise ProviderError(
                     ProviderErrorKind.INVALID_RESPONSE,

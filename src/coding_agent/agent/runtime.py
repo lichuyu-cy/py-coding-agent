@@ -26,6 +26,7 @@ from coding_agent.agent.loop import AgentLoop, LoopObserver, MinimalToolExecutor
 from coding_agent.context.builder import ContextManager, PromptSection
 from coding_agent.context.skills import SKILLS_DIR, SkillRegistry
 from coding_agent.domain.errors import HarnessError
+from coding_agent.domain.events import EventType
 from coding_agent.observability.event_bus import EventBus
 from coding_agent.observability.metrics import MetricsAccumulator
 from coding_agent.domain.messages import (
@@ -127,9 +128,11 @@ class AgentRuntime:
         context_manager: ContextManager | None = None,
         event_bus: EventBus | None = None,
         metrics: MetricsAccumulator | None = None,
+        streaming: bool = False,
     ) -> None:
         self.registry = registry or InMemorySessionRegistry()
-        self.bus = event_bus or EventBus()
+        # 流式增量属易失事件：慢订阅者丢弃而不阻塞控制路径。
+        self.bus = event_bus or EventBus(droppable=[EventType.LLM_REQUEST_STREAM])
         self.metrics = metrics or MetricsAccumulator.connect(self.bus)
         self._workspaces: dict[str, Path] = {}
         self._active_runs: dict[str, RunControl] = {}
@@ -145,6 +148,7 @@ class AgentRuntime:
             observation_formatter=observation_formatter,
             context_manager=context_manager,
             event_bus=self.bus,
+            streaming=streaming,
         )
 
     async def run(

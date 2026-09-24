@@ -41,6 +41,7 @@ from coding_agent.domain.state import (
 )
 from coding_agent.domain.events import EventType
 from coding_agent.observability.event_bus import EventBus
+from coding_agent.observability.stream import AgentStreamAggregator
 from coding_agent.ports.provider import (
     CancelSignal,
     ModelRequest,
@@ -48,7 +49,12 @@ from coding_agent.ports.provider import (
     Provider,
     ProviderError,
     ProviderErrorKind,
+    StopDelta,
+    TextDelta,
+    ToolCallDelta,
+    ToolCallFragmentDelta,
     ToolDefinition,
+    UsageDelta,
 )
 from coding_agent.ports.tool import ToolOutcome
 
@@ -152,6 +158,7 @@ class AgentLoop:
         observation_formatter: Callable[[ToolResult], str] | None = None,
         context_manager: ContextManager | None = None,
         event_bus: EventBus | None = None,
+        streaming: bool = False,
     ) -> None:
         self._provider = provider
         self._executor = executor
@@ -162,6 +169,7 @@ class AgentLoop:
         self._observer = observer
         self._observation_formatter = observation_formatter
         self._event_bus = event_bus
+        self._streaming = streaming
         self._context = context_manager or ContextManager(
             ContextPolicy(system_prompt=system_prompt),
             observation_formatter=observation_formatter,
@@ -313,6 +321,17 @@ class AgentLoop:
                 EventType.LLM_REQUEST_START,
                 {"request_id": request.request_id, "turn": state.current_turn},
             )
+
+            async def call_model() -> ModelResponse:
+                """按配置选择 complete 或 stream（增量聚合为同一完整响应契约）。"""
+                if not self._streaming:
+                    return await self._provider.complete(request, control.cancel)
+                aggregator = AgentStreamAggregator()
+                async for delta in self._provider.stream(request, control.cancel):
+                    aggregator.aggregate(delta)
+                    publish(EventType.LLM_REQUEST_STREAM, _stream_delta_payload(request, delta))
+                return aggregator.finalize_response()
+
             response: ModelResponse | None = None
             provider_error: ProviderError | None = None
             deadline_exceeded = False
@@ -320,7 +339,7 @@ class AgentLoop:
             while True:
                 provider_calls += 1
                 try:
-                    calls = self._provider.complete(request, control.cancel)
+                    calls = call_model()
                     if remaining is not None:
                         response = await asyncio.wait_for(calls, timeout=remaining)
                     else:
@@ -570,3 +589,26 @@ class AgentLoop:
             report=(lambda event_type, payload: report(event_type, dict(payload))) if report else None,
         )
         return ModelRequest(messages=snapshot.messages, tools=self._tools, model=self._model_name)
+
+
+def _stream_delta_payload(request: ModelRequest, delta: object) -> dict:
+    """易失增量事件的载荷（文本内容或分片长度；不含大对象）。"""
+    payload: dict = {"request_id": request.request_id}
+    if isinstance(delta, TextDelta):
+        payload.update(kind="text", text=delta.text)
+    elif isinstance(delta, ToolCallDelta):
+        payload.update(kind="tool_call", tool_call_id=str(delta.call.id), name=delta.call.name)
+    elif isinstance(delta, ToolCallFragmentDelta):
+        payload.update(
+            kind="tool_fragment",
+            tool_call_id=delta.call_id,
+            fragment_seq=delta.fragment_seq,
+            fragment_len=len(delta.arguments_fragment),
+        )
+    elif isinstance(delta, UsageDelta):
+        payload.update(kind="usage", usage=delta.usage)
+    elif isinstance(delta, StopDelta):
+        payload.update(kind="stop", stop_reason=delta.stop_reason.value)
+    else:  # pragma: no cover - 防御未知增量
+        payload.update(kind="unknown")
+    return payload
