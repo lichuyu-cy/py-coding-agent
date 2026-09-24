@@ -9,6 +9,7 @@ description = "Python coding agent harness: bounded agent loop, tool pipeline, c
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "httpx>=0.27",
     "jsonschema>=4.18",
     "pydantic>=2",
     "starlette>=0.37",
