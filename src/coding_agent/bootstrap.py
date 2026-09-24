@@ -12,6 +12,7 @@ from coding_agent.agent.loop import LoopObserver, RunLimits
 from coding_agent.agent.runtime import DEFAULT_SYSTEM_PROMPT, AgentRuntime
 from coding_agent.context.budget import TokenBudget, TokenManager
 from coding_agent.context.builder import ContextManager, ContextPolicy
+from coding_agent.context.compaction import Compactor
 from coding_agent.context.truncation import ToolOutputTruncator, TruncationPolicy
 from coding_agent.domain.messages import ToolResult
 from coding_agent.ports.provider import Provider, ToolDefinition
@@ -56,6 +57,7 @@ def build_runtime(
     context_manager: ContextManager | None = None,
     truncation_policy: TruncationPolicy | None = None,
     context_limit_tokens: int = 128_000,
+    compactor: Compactor | None = None,
 ) -> AgentRuntime:
     """组装 Runtime：注册表 → 工具声明（快照）→ Pipeline（含安全策略）→ Runtime。"""
     active_registry = registry or build_registry()
@@ -79,6 +81,7 @@ def build_runtime(
                 SimpleTokenCounter(),
                 budget=TokenBudget(context_limit=context_limit_tokens),
             ),
+            compactor=compactor or Compactor(),
         )
     return AgentRuntime(
         provider=provider,

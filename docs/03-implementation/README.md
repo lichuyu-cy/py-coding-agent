@@ -25,3 +25,4 @@
 | 11 | [11-tool-output-truncation.md](11-tool-output-truncation.md) | `feat: truncate tool outputs` |
 | 12 | [12-skill-loading.md](12-skill-loading.md) | `feat: load skills on demand` |
 | 13 | [13-token-management.md](13-token-management.md) | `feat: enforce token budgets` |
+| 14 | [14-compaction.md](14-compaction.md) | `feat: compact context safely` |

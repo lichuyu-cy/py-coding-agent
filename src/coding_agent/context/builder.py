@@ -17,6 +17,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 
 from coding_agent.context.budget import BudgetDecision, TokenManager
+from coding_agent.context.compaction import CompactionRecord, Compactor, render_summary
 from coding_agent.domain.errors import HarnessError
 from coding_agent.domain.messages import (
     AssistantMessage,
@@ -125,11 +126,14 @@ class ContextManager:
         counter: TokenCounter | None = None,
         observation_formatter: Callable[[ToolResult], str] | None = None,
         token_manager: TokenManager | None = None,
+        compactor: Compactor | None = None,
     ) -> None:
         self._policy = policy
         self._counter: TokenCounter = counter or SimpleTokenCounter()
         self._observation_formatter = observation_formatter
         self._token_manager = token_manager
+        self._compactor = compactor
+        self._records: dict[str, CompactionRecord] = {}  # 会话 → 已提交压缩记录（阶段 19 持久化）
 
     @property
     def policy(self) -> ContextPolicy:
@@ -172,9 +176,11 @@ class ContextManager:
         )
         if self._token_manager is not None:
             estimate = self._token_manager.estimate(provisional, tool_definitions=tool_definitions)
-            if estimate.decision is BudgetDecision.COMPACT:
-                raise ContextError(estimate.explanation)
-            if estimate.decision is BudgetDecision.REJECT:
+            if estimate.decision is not BudgetDecision.FIT:
+                # 超过阈值或超窗：先尝试压缩（覆盖部分从请求中移除后再评估）；
+                # 无压缩器时保持显式失败（设计：无法适配时明确报告）。
+                if self._compactor is not None:
+                    return self._compact_and_rebuild(log, sections, tool_definitions, estimate.explanation)
                 raise ContextError(estimate.explanation)
             estimated = estimate.total_tokens
         else:
@@ -185,6 +191,56 @@ class ContextManager:
                     f"exceed max_tokens {self._policy.max_tokens}"
                 )
         return replace(provisional, estimated_tokens=estimated)
+
+    def _compact_and_rebuild(
+        self,
+        log: MessageLog,
+        sections: Sequence[PromptSection],
+        tool_definitions: Sequence[ToolDefinition],
+        overflow_explanation: str,
+    ) -> ContextSnapshot:
+        """请求压缩并重建上下文：summary 段 + 未覆盖尾部；成功后才提交记录。"""
+        if self._compactor is None:
+            raise ContextError(overflow_explanation)
+        previous = self._records.get(log.session_id)
+        record = self._compactor.compact(log.messages, old_record=previous)
+        if record is None:
+            raise ContextError(
+                "compaction requested but no legal cut point is available; history is preserved"
+            )
+        augmented = (*sections, PromptSection(name="summary", content=render_summary(record.summary)))
+        system_content = "\n\n".join(section.content for section in augmented)
+        tail = self._tail_after(log, record.covered_through_id)
+        provider_messages = (
+            ProviderMessage(role=ProviderMessageRole.SYSTEM, content=system_content),
+            *convert_to_provider(tail, observation_formatter=self._observation_formatter),
+        )
+        source_ids = tuple(f"section:{section.name}" for section in augmented) + tuple(
+            str(message.meta.id) for message in tail
+        )
+        provisional = ContextSnapshot(
+            messages=provider_messages,
+            source_ids=source_ids,
+            estimated_tokens=0,
+            sections=augmented,
+            summary_version=record.summary_version,
+        )
+        assert self._token_manager is not None
+        estimate = self._token_manager.estimate(provisional, tool_definitions=tool_definitions)
+        if estimate.decision is BudgetDecision.REJECT:
+            raise ContextError(f"context still does not fit after compaction: {estimate.explanation}")
+        # 原子提交：只有重建成功才保存记录；相同覆盖边界的重算不递增版本
+        if previous is None or previous.covered_through_id != record.covered_through_id:
+            self._records[log.session_id] = record
+        return replace(provisional, estimated_tokens=estimate.total_tokens)
+
+    @staticmethod
+    def _tail_after(log: MessageLog, covered_through_id: str) -> tuple[Message, ...]:
+        messages = log.messages
+        for index, message in enumerate(messages):
+            if str(message.meta.id) == covered_through_id:
+                return tuple(messages[index + 1 :])
+        raise ContextError(f"covered_through_id {covered_through_id!r} is not in the history")
 
     @staticmethod
     def _validate_history(messages: Sequence[Message]) -> None:
